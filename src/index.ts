@@ -10,7 +10,7 @@ async function main() {
 
   const db = new Database(config.databaseUrl);
   const indexer = new Indexer(db);
-  const api = new Api(db, config.apiPort);
+  const api = new Api(db, config.apiPort, indexer);
 
   // Graceful shutdown
   const shutdown = async () => {

@@ -1,6 +1,7 @@
 import http from "node:http";
 import { URL } from "node:url";
 import { Database } from "./db/queries.js";
+import type { Indexer } from "./indexer.js";
 
 type RouteHandler = (
   params: URLSearchParams,
@@ -10,10 +11,12 @@ type RouteHandler = (
 export class Api {
   private server: http.Server;
   private db: Database;
+  private indexer?: Indexer;
   private routes: Map<string, RouteHandler> = new Map();
 
-  constructor(db: Database, port: number) {
+  constructor(db: Database, port: number, indexer?: Indexer) {
     this.db = db;
+    this.indexer = indexer;
     this.registerRoutes();
     this.server = http.createServer((req, res) => this.handleRequest(req, res));
     this.server.listen(port, () => {
@@ -21,6 +24,9 @@ export class Api {
       console.log("Available endpoints:");
       console.log("  GET /health                          - Health check");
       console.log("  GET /stats                           - Network overview stats");
+      console.log("  GET /stats/timeline                  - Historical metrics time-series");
+      console.log("  GET /stats/throughput                - Event throughput by hour");
+      console.log("  GET /stats/latency                   - Live RPC latency metrics");
       console.log("  GET /validators                      - List all validators");
       console.log("  GET /validators/:address             - Single validator details");
       console.log("  GET /validators/:address/history     - Validator event history");
@@ -28,6 +34,7 @@ export class Api {
       console.log("  GET /validators/:address/delegations - Delegations for validator");
       console.log("  GET /epochs                          - List epochs");
       console.log("  GET /epochs/:epoch                   - Single epoch details");
+      console.log("  GET /epochs/durations                - Epoch duration analysis");
       console.log("  GET /events                          - Query all events");
       console.log("  GET /events/slashes                  - Recent slashing events");
       console.log("  GET /delegations                     - Query delegations");
@@ -220,6 +227,52 @@ export class Api {
         offset: parseInt(params.get("offset") || "0"),
       });
     });
+
+    // ──────────────────────────────────────────────────────────
+    // GET /stats/timeline
+    // Network metrics time-series for dashboard charts
+    // Query params:
+    //   ?hours=24    (how far back, default 24)
+    //   ?limit=200   (max data points, default 200)
+    // ──────────────────────────────────────────────────────────
+    this.routes.set("GET /stats/timeline", async (params) => {
+      const hours = parseInt(params.get("hours") || "24");
+      const limit = parseInt(params.get("limit") || "200");
+      return this.db.getMetricsTimeline(hours, limit);
+    });
+
+    // ──────────────────────────────────────────────────────────
+    // GET /stats/throughput
+    // Event throughput breakdown by hour and category
+    // Query params:
+    //   ?hours=24    (how far back, default 24)
+    // ──────────────────────────────────────────────────────────
+    this.routes.set("GET /stats/throughput", async (params) => {
+      const hours = parseInt(params.get("hours") || "24");
+      return this.db.getThroughputStats(hours);
+    });
+
+    // ──────────────────────────────────────────────────────────
+    // GET /stats/latency
+    // Live RPC latency metrics from the indexer
+    // ──────────────────────────────────────────────────────────
+    this.routes.set("GET /stats/latency", async () => {
+      if (!this.indexer) {
+        return { error: "Indexer not connected" };
+      }
+      return this.indexer.getLatencyStats();
+    });
+
+    // ──────────────────────────────────────────────────────────
+    // GET /epochs/durations
+    // Epoch duration analysis with per-epoch prime/slash counts
+    // Query params:
+    //   ?limit=50    (default 50)
+    // ──────────────────────────────────────────────────────────
+    this.routes.set("GET /epochs/durations", async (params) => {
+      const limit = parseInt(params.get("limit") || "50");
+      return this.db.getEpochDurations(limit);
+    });
   }
 
   private async handleRequest(req: http.IncomingMessage, res: http.ServerResponse) {
@@ -252,6 +305,9 @@ export class Api {
           availableEndpoints: [
             "GET /health",
             "GET /stats",
+            "GET /stats/timeline",
+            "GET /stats/throughput",
+            "GET /stats/latency",
             "GET /validators",
             "GET /validators/:address",
             "GET /validators/:address/history",
@@ -259,6 +315,7 @@ export class Api {
             "GET /validators/:address/delegations",
             "GET /epochs",
             "GET /epochs/:epoch",
+            "GET /epochs/durations",
             "GET /events",
             "GET /events/slashes",
             "GET /delegations",
@@ -318,6 +375,17 @@ export class Api {
     // /validators/:address
     if (pathParts.length === 2 && pathParts[0] === "validators") {
       return this.routes.get("GET /validators/:address")!;
+    }
+
+    // /epochs/durations (must check before :epoch to avoid matching "durations" as epoch number)
+    if (pathParts.length === 2 && pathParts[0] === "epochs" && pathParts[1] === "durations") {
+      return this.routes.get("GET /epochs/durations")!;
+    }
+
+    // /stats/timeline, /stats/throughput, /stats/latency
+    if (pathParts.length === 2 && pathParts[0] === "stats") {
+      const subRoute = `GET /stats/${pathParts[1]}`;
+      if (this.routes.has(subRoute)) return this.routes.get(subRoute)!;
     }
 
     // /epochs/:epoch
