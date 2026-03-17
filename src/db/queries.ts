@@ -375,7 +375,7 @@ export class Database {
   }>) {
     await this.pool.query(
       `INSERT INTO validator_tx_participation (tx_id, validator, role, vote_type, vote_committed, vote_revealed, block_number, updated_at)
-       VALUES ($1, $2, $3, $4, $5, $6, $7, NOW())
+       VALUES ($1, $2, COALESCE($3, 'validator'), $4, COALESCE($5, false), COALESCE($6, false), $7, NOW())
        ON CONFLICT (tx_id, validator) DO UPDATE SET
          role = COALESCE($3, validator_tx_participation.role),
          vote_type = COALESCE($4, validator_tx_participation.vote_type),
