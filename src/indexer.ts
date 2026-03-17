@@ -50,6 +50,11 @@ export class Indexer {
     console.log(`  RPC: ${config.rpcUrl}`);
     console.log(`  Staking contract: ${config.stakingContract}`);
     console.log(`  Consensus contract: ${config.consensusContract}`);
+    if (config.slashingContract) {
+      console.log(`  Slashing contract: ${config.slashingContract}`);
+    } else {
+      console.log(`  Slashing contract: NOT CONFIGURED (SlashedFromIdleness events will not be indexed)`);
+    }
     console.log(`  Batch size: ${config.batchSize}`);
     console.log(`  Poll interval: ${config.pollIntervalMs}ms`);
 
@@ -73,8 +78,8 @@ export class Indexer {
   private async indexBatch() {
     const currentBlock = await this.measureRpc("ping", () => this.client.getBlockNumber());
 
-    // Index both contracts in parallel for ~2x faster catch-up
-    await Promise.all([
+    // Index contracts in parallel
+    const contracts: Array<Promise<void>> = [
       this.indexContract(
         config.stakingContract,
         STAKING_EVENTS_ABI as unknown as AbiEvent[],
@@ -82,10 +87,21 @@ export class Indexer {
       ),
       this.indexContract(
         config.consensusContract,
-        [...SLASHING_EVENTS_ABI, ...CONSENSUS_EVENTS_ABI] as unknown as AbiEvent[],
+        CONSENSUS_EVENTS_ABI as unknown as AbiEvent[],
         currentBlock
       ),
-    ]);
+    ];
+    // Slashing contract is separate — only index if configured
+    if (config.slashingContract) {
+      contracts.push(
+        this.indexContract(
+          config.slashingContract,
+          SLASHING_EVENTS_ABI as unknown as AbiEvent[],
+          currentBlock
+        )
+      );
+    }
+    await Promise.all(contracts);
 
     // Record metrics snapshot periodically
     this.batchCount++;
@@ -162,6 +178,8 @@ export class Indexer {
       );
     }
 
+    // Only advance cursor after events are fully processed
+    // If processEvents threw, we'll re-process on next run (insertEvents uses ON CONFLICT DO NOTHING)
     await this.db.setLastBlock(contractAddress, toBlock);
   }
 
@@ -262,7 +280,9 @@ export class Indexer {
       try {
         await this.processEvent(event);
       } catch (err) {
-        console.error(`Error processing event ${event.eventName}:`, err);
+        // Log but re-throw to prevent setLastBlock from advancing past failed events
+        console.error(`Error processing event ${event.eventName} at block ${event.blockNumber}:`, err);
+        throw err;
       }
     }
   }
@@ -312,7 +332,13 @@ export class Indexer {
 
       case "ValidatorClaim": {
         const validator = (args.validator as string).toLowerCase();
+        const claimAmount = args.amount as string | undefined;
+        if (claimAmount) {
+          // Reduce stake by claimed amount (post-exit withdrawal)
+          await this.db.decrementValidatorStake(validator, claimAmount);
+        }
         await this.db.upsertValidator(validator, {
+          status: "inactive",
           lastSeenBlock: blockNumber,
         });
         break;
@@ -323,17 +349,9 @@ export class Indexer {
         const epoch = BigInt(args.epoch as string);
         const validatorRewards = args.validatorRewards as string;
 
-        // Get current validator to increment counters
-        const current = await this.db.getValidator(validator);
-        const newPrimeCount = (current?.prime_count || 0) + 1;
-        const newTotalRewards = (
-          BigInt(current?.total_rewards || "0") + BigInt(validatorRewards)
-        ).toString();
-
+        // Atomic increment — no read-modify-write race
+        await this.db.incrementValidatorPrime(validator, validatorRewards, epoch);
         await this.db.upsertValidator(validator, {
-          primeCount: newPrimeCount,
-          totalRewards: newTotalRewards,
-          lastPrimeEpoch: epoch,
           lastSeenBlock: blockNumber,
         });
         break;
@@ -342,17 +360,10 @@ export class Indexer {
       case "ValidatorSlash": {
         const validator = (args.validator as string).toLowerCase();
         const validatorSlashing = args.validatorSlashing as string;
-        const epoch = BigInt(args.epoch as string);
 
-        const current = await this.db.getValidator(validator);
-        const newSlashCount = (current?.slash_count || 0) + 1;
-        const newTotalSlashed = (
-          BigInt(current?.total_slashed || "0") + BigInt(validatorSlashing)
-        ).toString();
-
+        // Atomic increment — no read-modify-write race
+        await this.db.incrementValidatorSlash(validator, validatorSlashing);
         await this.db.upsertValidator(validator, {
-          slashCount: newSlashCount,
-          totalSlashed: newTotalSlashed,
           lastSeenBlock: blockNumber,
         });
         break;
@@ -404,9 +415,12 @@ export class Indexer {
 
       case "EpochAdvance": {
         const epoch = BigInt(args.epoch as string);
+        // Snapshot current active validator count at epoch boundary
+        const activeCount = await this.db.getActiveValidatorCount();
         await this.db.upsertEpoch(epoch, {
           advancedAtBlock: blockNumber,
           advancedAtTimestamp: event.blockTimestamp,
+          validatorCount: activeCount,
         });
         break;
       }
@@ -515,7 +529,8 @@ export class Indexer {
           voteType,
           blockNumber,
         });
-        await this.db.upsertConsensusTx(txId, { voteType });
+        // Individual vote types are stored per-validator in participation table.
+        // Don't overwrite consensus_tx.vote_type — it would only keep the last voter's type.
         break;
       }
 
@@ -616,7 +631,47 @@ export class Indexer {
         break;
       }
 
-      // Infrastructure events - stored in raw events table, no aggregation
+      // Economics events — stored in raw events table, amounts tracked via epoch/inflation
+      case "FeesReceived":
+      case "BurnToL1":
+      case "BurnFailed":
+      case "InflationInitiated":
+        break;
+
+      // Delegator claim — no delegation state change needed (just a reward withdrawal)
+      case "DelegatorClaim":
+        break;
+
+      // Epoch lifecycle events — stored in raw events
+      case "EpochZeroEnded":
+      case "EpochHasPendingTribunals":
+        break;
+
+      // Quarantine batch cleanup — individual quarantine events already tracked
+      case "QuarantinesCleanedUp":
+        break;
+
+      // Validator registration batch — individual joins already tracked
+      case "ValidatorsRegistered":
+        break;
+
+      // Governance parameter changes — stored in raw events for audit trail
+      case "SetValidatorMinimumStake":
+      case "SetDelegatorMinimumStake":
+      case "SetMaxValidators":
+      case "SetEpochMinDuration":
+      case "SetEpochMinDurationThreshold":
+      case "SetEpochZeroMinDuration":
+      case "SetValidatorWeightParams":
+      case "SetUnbondingPeriods":
+      case "SetReductionFactor":
+      case "SetGen":
+      case "SetDeepthought":
+      case "SetTransactionFeesManager":
+      case "SetStakingInvariant":
+        break;
+
+      // Infrastructure events — stored in raw events table, no aggregation
       case "CreatedTransaction":
       case "TransactionFinalizationFailed":
       case "TransactionNeedsRecomputation":
@@ -628,28 +683,29 @@ export class Indexer {
       case "AddressManagerSet":
         break;
 
+      default:
+        // Unknown event — already stored in raw events table
+        console.warn(`Unhandled event: ${eventName}`);
+        break;
+
       case "SlashedFromIdleness": {
         const validator = (args.validator as string).toLowerCase();
         const percentage = args.percentage as string;
-        const current = await this.db.getValidator(validator);
-        const newSlashCount = (current?.slash_count || 0) + 1;
 
-        // Calculate slashed amount from percentage and current stake
+        // Calculate slashed amount from percentage (basis points: 100 = 1%) and current stake
         let slashAmount = "0";
-        if (current?.total_stake && percentage) {
-          const stake = BigInt(current.total_stake);
-          const pct = BigInt(percentage);
-          // percentage is in basis points or direct - divide by 100
-          slashAmount = ((stake * pct) / 100n).toString();
+        if (percentage) {
+          const current = await this.db.getValidator(validator);
+          if (current?.total_stake) {
+            const stake = BigInt(current.total_stake);
+            const pct = BigInt(percentage);
+            slashAmount = ((stake * pct) / 10000n).toString();
+          }
         }
 
-        const newTotalSlashed = (
-          BigInt(current?.total_slashed || "0") + BigInt(slashAmount)
-        ).toString();
-
+        // Atomic increment — no read-modify-write race
+        await this.db.incrementValidatorSlash(validator, slashAmount);
         await this.db.upsertValidator(validator, {
-          slashCount: newSlashCount,
-          totalSlashed: newTotalSlashed,
           lastSeenBlock: blockNumber,
         });
         break;

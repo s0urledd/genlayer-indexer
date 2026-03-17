@@ -12,6 +12,17 @@ export class Database {
     await this.pool.end();
   }
 
+  async ping() {
+    await this.pool.query("SELECT 1");
+  }
+
+  async getActiveValidatorCount(): Promise<number> {
+    const result = await this.pool.query(
+      "SELECT COUNT(*) as count FROM validators WHERE status = 'active'"
+    );
+    return parseInt(result.rows[0].count);
+  }
+
   // ============================================================
   // Indexer State
   // ============================================================
@@ -207,10 +218,48 @@ export class Database {
   }
 
   // Atomically increment validator stake (for ValidatorDeposit)
+  // Uses upsert so deposits arriving before ValidatorJoin are not lost
   async incrementValidatorStake(address: string, amount: string) {
     await this.pool.query(
+      `INSERT INTO validators (address, total_stake, updated_at)
+       VALUES ($1, $2, NOW())
+       ON CONFLICT (address) DO UPDATE SET
+         total_stake = validators.total_stake + $2,
+         updated_at = NOW()`,
+      [address.toLowerCase(), amount]
+    );
+  }
+
+  // Atomically increment prime_count and add rewards (for ValidatorPrime)
+  async incrementValidatorPrime(address: string, rewards: string, epoch: bigint) {
+    await this.pool.query(
       `UPDATE validators SET
-        total_stake = total_stake + $2,
+        prime_count = prime_count + 1,
+        total_rewards = total_rewards + $2,
+        last_prime_epoch = $3,
+        updated_at = NOW()
+       WHERE address = $1`,
+      [address.toLowerCase(), rewards, epoch.toString()]
+    );
+  }
+
+  // Atomically increment slash_count and add slashed amount (for ValidatorSlash/SlashedFromIdleness)
+  async incrementValidatorSlash(address: string, slashedAmount: string) {
+    await this.pool.query(
+      `UPDATE validators SET
+        slash_count = slash_count + 1,
+        total_slashed = total_slashed + $2,
+        updated_at = NOW()
+       WHERE address = $1`,
+      [address.toLowerCase(), slashedAmount]
+    );
+  }
+
+  // Atomically decrement validator stake (for ValidatorClaim withdrawal)
+  async decrementValidatorStake(address: string, amount: string) {
+    await this.pool.query(
+      `UPDATE validators SET
+        total_stake = GREATEST(total_stake - $2, 0),
         updated_at = NOW()
        WHERE address = $1`,
       [address.toLowerCase(), amount]
@@ -375,6 +424,7 @@ export class Database {
         COUNT(*) FILTER (WHERE status NOT IN ('accepted', 'finalized', 'undetermined', 'cancelled')) as in_progress,
         COALESCE(AVG(rotation_count), 0) as avg_rotations,
         COALESCE(AVG(appeal_count), 0) as avg_appeals
+      FROM consensus_transactions
     `);
     return result.rows[0];
   }
@@ -496,7 +546,7 @@ export class Database {
        LEFT JOIN (
          SELECT args->>'validator' as validator,
            ROUND(COUNT(*)::numeric / GREATEST(
-             (SELECT COUNT(*) FROM epochs ORDER BY epoch DESC LIMIT 30), 1
+             (SELECT COUNT(*) FROM (SELECT 1 FROM epochs ORDER BY epoch DESC LIMIT 30) _e), 1
            ) * 100, 2) as uptime_pct
          FROM events
          WHERE event_name = 'ValidatorPrime'
@@ -537,13 +587,13 @@ export class Database {
     return result.rows[0] || null;
   }
 
-  async getValidatorHistory(address: string, limit = 50) {
+  async getValidatorHistory(address: string, limit = 50, offset = 0) {
     const result = await this.pool.query(
       `SELECT * FROM events
        WHERE args->>'validator' = $1
        ORDER BY block_number DESC, log_index DESC
-       LIMIT $2`,
-      [address.toLowerCase(), limit]
+       LIMIT $2 OFFSET $3`,
+      [address.toLowerCase(), limit, offset]
     );
     return result.rows;
   }
@@ -614,14 +664,21 @@ export class Database {
         (SELECT COUNT(*) FROM events WHERE block_timestamp > NOW() - INTERVAL '24 hours') as events_last_24h,
         (SELECT COUNT(*) FROM delegations) as total_delegations,
         (SELECT COALESCE(SUM(total_deposited - total_withdrawn), 0) FROM delegations) as total_delegated,
-        (SELECT CASE WHEN COALESCE(SUM(total_stake), 0) > 0 AND MAX(epoch) > 0
+        -- Estimated APY based on actual elapsed time (first epoch timestamp to now)
+        (SELECT CASE
+          WHEN COALESCE(SUM(v.total_stake), 0) > 0
+            AND first_epoch.ts IS NOT NULL
+            AND EXTRACT(EPOCH FROM NOW() - first_epoch.ts) > 0
           THEN ROUND(
-            COALESCE(SUM(total_rewards), 0) / COALESCE(SUM(total_stake), 1) *
-            (365.0 / GREATEST(MAX(epoch), 1)) * 100, 2
+            COALESCE(SUM(v.total_rewards), 0) / GREATEST(SUM(v.total_stake), 1) *
+            (365.25 * 86400.0 / EXTRACT(EPOCH FROM NOW() - first_epoch.ts)) * 100, 2
           )
           ELSE 0
-        END FROM validators
-        CROSS JOIN (SELECT MAX(epoch) as epoch FROM epochs) ep
+        END
+        FROM validators v
+        CROSS JOIN (
+          SELECT MIN(advanced_at_timestamp) as ts FROM epochs WHERE advanced_at_timestamp IS NOT NULL
+        ) first_epoch
         ) as estimated_apy
     `);
     return result.rows[0];
@@ -752,7 +809,7 @@ export class Database {
   }
 
   async getThroughputStats(hours = 24) {
-    // Events per hour for the last N hours
+    // Events per hour for the last N hours, including consensus categories
     const result = await this.pool.query(
       `SELECT
          date_trunc('hour', block_timestamp) as hour,
@@ -761,7 +818,11 @@ export class Database {
          COUNT(*) FILTER (WHERE category = 'delegator_lifecycle') as delegator_events,
          COUNT(*) FILTER (WHERE category = 'slashing') as slashing_events,
          COUNT(*) FILTER (WHERE category = 'epoch') as epoch_events,
-         COUNT(*) FILTER (WHERE category = 'economics') as economics_events
+         COUNT(*) FILTER (WHERE category = 'economics') as economics_events,
+         COUNT(*) FILTER (WHERE category = 'consensus_tx') as consensus_tx_events,
+         COUNT(*) FILTER (WHERE category = 'consensus_vote') as consensus_vote_events,
+         COUNT(*) FILTER (WHERE category IN ('consensus_appeal', 'consensus_rotation')) as consensus_appeal_rotation_events,
+         COUNT(*) FILTER (WHERE category = 'governance') as governance_events
        FROM events
        WHERE block_timestamp > NOW() - INTERVAL '1 hour' * $1
        GROUP BY date_trunc('hour', block_timestamp)
@@ -1144,7 +1205,7 @@ export class Database {
        LEFT JOIN (
          SELECT args->>'validator' as validator,
            ROUND(COUNT(*)::numeric / GREATEST(
-             (SELECT COUNT(*) FROM epochs ORDER BY epoch DESC LIMIT 30), 1
+             (SELECT COUNT(*) FROM (SELECT 1 FROM epochs ORDER BY epoch DESC LIMIT 30) _e), 1
            ) * 100, 2) as uptime_pct
          FROM events
          WHERE event_name = 'ValidatorPrime'
@@ -1221,7 +1282,7 @@ export class Database {
        LEFT JOIN (
          SELECT args->>'validator' as validator,
            ROUND(COUNT(*)::numeric / GREATEST(
-             (SELECT COUNT(*) FROM epochs ORDER BY epoch DESC LIMIT 30), 1
+             (SELECT COUNT(*) FROM (SELECT 1 FROM epochs ORDER BY epoch DESC LIMIT 30) _e), 1
            ) * 100, 2) as uptime_pct
          FROM events
          WHERE event_name = 'ValidatorPrime'
