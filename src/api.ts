@@ -24,6 +24,7 @@ export class Api {
       console.log("Available endpoints:");
       console.log("  GET /health                          - Health check");
       console.log("  GET /stats                           - Network overview stats");
+      console.log("  GET /stats/network-uptime             - Per-epoch network uptime");
       console.log("  GET /stats/timeline                  - Historical metrics time-series");
       console.log("  GET /stats/throughput                - Event throughput by hour");
       console.log("  GET /stats/latency                   - Live RPC latency metrics");
@@ -229,6 +230,17 @@ export class Api {
     });
 
     // ──────────────────────────────────────────────────────────
+    // GET /stats/network-uptime
+    // Per-epoch network uptime (% of validators that primed)
+    // Query params:
+    //   ?epochs=30  (default 30)
+    // ──────────────────────────────────────────────────────────
+    this.routes.set("GET /stats/network-uptime", async (params) => {
+      const epochCount = parseInt(params.get("epochs") || "30");
+      return this.db.getNetworkUptimeByEpoch(epochCount);
+    });
+
+    // ──────────────────────────────────────────────────────────
     // GET /stats/timeline
     // Network metrics time-series for dashboard charts
     // Query params:
@@ -305,6 +317,7 @@ export class Api {
           availableEndpoints: [
             "GET /health",
             "GET /stats",
+            "GET /stats/network-uptime",
             "GET /stats/timeline",
             "GET /stats/throughput",
             "GET /stats/latency",

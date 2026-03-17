@@ -45,6 +45,8 @@ CREATE TABLE IF NOT EXISTS epochs (
   epoch BIGINT PRIMARY KEY,
   advanced_at_block BIGINT,
   finalized_at_block BIGINT,
+  advanced_at_timestamp TIMESTAMPTZ,
+  finalized_at_timestamp TIMESTAMPTZ,
   inflation_amount NUMERIC,
   validator_count INTEGER,
   updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
@@ -75,6 +77,13 @@ CREATE TABLE IF NOT EXISTS network_metrics (
   rpc_latency_avg_ms INTEGER,
   rpc_latency_p95_ms INTEGER
 );
+
+-- Add timestamp columns to epochs if missing (for existing databases)
+DO $$ BEGIN
+  ALTER TABLE epochs ADD COLUMN IF NOT EXISTS advanced_at_timestamp TIMESTAMPTZ;
+  ALTER TABLE epochs ADD COLUMN IF NOT EXISTS finalized_at_timestamp TIMESTAMPTZ;
+EXCEPTION WHEN others THEN NULL;
+END $$;
 
 -- Indexes for common queries
 CREATE INDEX IF NOT EXISTS idx_metrics_timestamp ON network_metrics(timestamp);

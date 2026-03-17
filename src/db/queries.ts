@@ -178,22 +178,28 @@ export class Database {
   async upsertEpoch(epoch: bigint, data: Partial<{
     advancedAtBlock: bigint;
     finalizedAtBlock: bigint;
+    advancedAtTimestamp: Date;
+    finalizedAtTimestamp: Date;
     inflationAmount: string;
     validatorCount: number;
   }>) {
     await this.pool.query(
-      `INSERT INTO epochs (epoch, advanced_at_block, finalized_at_block, inflation_amount, validator_count, updated_at)
-       VALUES ($1, $2, $3, $4, $5, NOW())
+      `INSERT INTO epochs (epoch, advanced_at_block, finalized_at_block, advanced_at_timestamp, finalized_at_timestamp, inflation_amount, validator_count, updated_at)
+       VALUES ($1, $2, $3, $4, $5, $6, $7, NOW())
        ON CONFLICT (epoch) DO UPDATE SET
          advanced_at_block = COALESCE($2, epochs.advanced_at_block),
          finalized_at_block = COALESCE($3, epochs.finalized_at_block),
-         inflation_amount = COALESCE($4, epochs.inflation_amount),
-         validator_count = COALESCE($5, epochs.validator_count),
+         advanced_at_timestamp = COALESCE($4, epochs.advanced_at_timestamp),
+         finalized_at_timestamp = COALESCE($5, epochs.finalized_at_timestamp),
+         inflation_amount = COALESCE($6, epochs.inflation_amount),
+         validator_count = COALESCE($7, epochs.validator_count),
          updated_at = NOW()`,
       [
         epoch.toString(),
         data.advancedAtBlock?.toString() || null,
         data.finalizedAtBlock?.toString() || null,
+        data.advancedAtTimestamp || null,
+        data.finalizedAtTimestamp || null,
         data.inflationAmount || null,
         data.validatorCount ?? null,
       ]
@@ -329,7 +335,7 @@ export class Database {
     let paramIndex = 1;
 
     if (params?.status) {
-      conditions.push(`status = $${paramIndex++}`);
+      conditions.push(`v.status = $${paramIndex++}`);
       values.push(params.status);
     }
 
@@ -338,8 +344,37 @@ export class Database {
     const offset = params?.offset || 0;
 
     const result = await this.pool.query(
-      `SELECT * FROM validators ${where}
-       ORDER BY total_stake DESC
+      `SELECT v.*,
+        COALESCE(d.delegated_stake, 0) as delegated_stake,
+        COALESCE(d.delegator_count, 0) as delegator_count,
+        v.total_stake - COALESCE(d.delegated_stake, 0) as self_stake,
+        CASE WHEN v.prime_count + v.slash_count > 0
+          THEN ROUND(v.prime_count::numeric / (v.prime_count + v.slash_count) * 100, 2)
+          ELSE 100
+        END as participation_score,
+        COALESCE(u.uptime_pct, 100) as uptime_percentage
+       FROM validators v
+       LEFT JOIN (
+         SELECT validator_address,
+           SUM(total_deposited - total_withdrawn) as delegated_stake,
+           COUNT(*) FILTER (WHERE total_deposited > total_withdrawn) as delegator_count
+         FROM delegations
+         GROUP BY validator_address
+       ) d ON d.validator_address = v.address
+       LEFT JOIN (
+         SELECT args->>'validator' as validator,
+           ROUND(COUNT(*)::numeric / GREATEST(
+             (SELECT COUNT(*) FROM epochs ORDER BY epoch DESC LIMIT 30), 1
+           ) * 100, 2) as uptime_pct
+         FROM events
+         WHERE event_name = 'ValidatorPrime'
+           AND (args->>'epoch')::bigint >= COALESCE(
+             (SELECT MAX(epoch) - 29 FROM epochs), 0
+           )
+         GROUP BY args->>'validator'
+       ) u ON u.validator = v.address
+       ${where}
+       ORDER BY v.total_stake DESC
        LIMIT $${paramIndex++} OFFSET $${paramIndex++}`,
       [...values, limit, offset]
     );
@@ -348,7 +383,23 @@ export class Database {
 
   async getValidator(address: string) {
     const result = await this.pool.query(
-      "SELECT * FROM validators WHERE address = $1",
+      `SELECT v.*,
+        COALESCE(d.delegated_stake, 0) as delegated_stake,
+        COALESCE(d.delegator_count, 0) as delegator_count,
+        v.total_stake - COALESCE(d.delegated_stake, 0) as self_stake,
+        CASE WHEN v.prime_count + v.slash_count > 0
+          THEN ROUND(v.prime_count::numeric / (v.prime_count + v.slash_count) * 100, 2)
+          ELSE 100
+        END as participation_score
+       FROM validators v
+       LEFT JOIN (
+         SELECT validator_address,
+           SUM(total_deposited - total_withdrawn) as delegated_stake,
+           COUNT(*) FILTER (WHERE total_deposited > total_withdrawn) as delegator_count
+         FROM delegations
+         GROUP BY validator_address
+       ) d ON d.validator_address = v.address
+       WHERE v.address = $1`,
       [address.toLowerCase()]
     );
     return result.rows[0] || null;
@@ -430,7 +481,16 @@ export class Database {
         (SELECT COUNT(*) FROM events WHERE block_timestamp > NOW() - INTERVAL '1 hour') as events_last_hour,
         (SELECT COUNT(*) FROM events WHERE block_timestamp > NOW() - INTERVAL '24 hours') as events_last_24h,
         (SELECT COUNT(*) FROM delegations) as total_delegations,
-        (SELECT COALESCE(SUM(total_deposited - total_withdrawn), 0) FROM delegations) as total_delegated
+        (SELECT COALESCE(SUM(total_deposited - total_withdrawn), 0) FROM delegations) as total_delegated,
+        (SELECT CASE WHEN COALESCE(SUM(total_stake), 0) > 0 AND MAX(epoch) > 0
+          THEN ROUND(
+            COALESCE(SUM(total_rewards), 0) / COALESCE(SUM(total_stake), 1) *
+            (365.0 / GREATEST(MAX(epoch), 1)) * 100, 2
+          )
+          ELSE 0
+        END FROM validators
+        CROSS JOIN (SELECT MAX(epoch) as epoch FROM epochs) ep
+        ) as estimated_apy
     `);
     return result.rows[0];
   }
@@ -518,6 +578,45 @@ export class Database {
       [limit]
     );
     return result.rows;
+  }
+
+  async getNetworkUptimeByEpoch(epochCount = 30) {
+    const result = await this.pool.query(
+      `SELECT
+         e.epoch,
+         e.advanced_at_block,
+         e.finalized_at_block,
+         COALESCE(p.primed_count, 0) as primed_validators,
+         COALESCE(e.validator_count,
+           (SELECT COUNT(*) FROM validators WHERE status = 'active')
+         ) as total_validators,
+         CASE WHEN COALESCE(e.validator_count,
+           (SELECT COUNT(*) FROM validators WHERE status = 'active')
+         ) > 0
+           THEN ROUND(
+             COALESCE(p.primed_count, 0)::numeric /
+             COALESCE(e.validator_count,
+               (SELECT COUNT(*) FROM validators WHERE status = 'active')
+             ) * 100, 2
+           )
+           ELSE 0
+         END as uptime_percentage
+       FROM epochs e
+       LEFT JOIN (
+         SELECT (args->>'epoch')::bigint as epoch, COUNT(DISTINCT args->>'validator') as primed_count
+         FROM events
+         WHERE event_name = 'ValidatorPrime'
+         GROUP BY (args->>'epoch')::bigint
+       ) p ON p.epoch = e.epoch
+       ORDER BY e.epoch DESC
+       LIMIT $1`,
+      [epochCount]
+    );
+    const rows = result.rows;
+    const avgUptime = rows.length > 0
+      ? (rows.reduce((sum: number, r: { uptime_percentage: string }) => sum + parseFloat(r.uptime_percentage), 0) / rows.length).toFixed(2)
+      : "0.00";
+    return { avgUptime, epochs: rows };
   }
 
   async getThroughputStats(hours = 24) {

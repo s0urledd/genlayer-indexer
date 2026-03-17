@@ -254,6 +254,7 @@ export class Indexer {
       blockNumber: bigint;
       eventName: string;
       args: Record<string, unknown>;
+      blockTimestamp?: Date;
     }>
   ) {
     for (const event of events) {
@@ -269,6 +270,7 @@ export class Indexer {
     blockNumber: bigint;
     eventName: string;
     args: Record<string, unknown>;
+    blockTimestamp?: Date;
   }) {
     const { eventName, args, blockNumber } = event;
 
@@ -403,6 +405,7 @@ export class Indexer {
         const epoch = BigInt(args.epoch as string);
         await this.db.upsertEpoch(epoch, {
           advancedAtBlock: blockNumber,
+          advancedAtTimestamp: event.blockTimestamp,
         });
         break;
       }
@@ -411,6 +414,7 @@ export class Indexer {
         const epoch = BigInt(args.epoch as string);
         await this.db.upsertEpoch(epoch, {
           finalizedAtBlock: blockNumber,
+          finalizedAtTimestamp: event.blockTimestamp,
         });
         break;
       }
