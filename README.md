@@ -53,7 +53,7 @@ All endpoints return JSON. Default port: `3000`.
 | `GET /stats/network-uptime` | Per-epoch network uptime (% of validators that primed) |
 | `GET /stats/timeline` | Historical metrics time-series |
 | `GET /stats/throughput` | Event throughput by hour and category |
-| `GET /stats/latency` | Live RPC latency metrics (avg, p50, p95) |
+| `GET /stats/latency` | RPC ping latency + log fetch duration (avg, p50, p95) |
 
 ### Validators
 
