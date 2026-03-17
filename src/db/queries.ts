@@ -323,7 +323,7 @@ export class Database {
   }>) {
     await this.pool.query(
       `INSERT INTO consensus_transactions (tx_id, recipient, activator, leader, status, vote_type, result_type, rotation_count, appeal_count, validators, created_at_block, created_at_timestamp, accepted_at_block, finalized_at_block, updated_at)
-       VALUES ($1, $2, $3, $4, $5, $6, $7, COALESCE($8, 0), COALESCE($9, 0), $10, $11, $12, $13, $14, NOW())
+       VALUES ($1, $2, $3, $4, COALESCE($5, 'pending'), $6, $7, COALESCE($8, 0), COALESCE($9, 0), $10, $11, $12, $13, $14, NOW())
        ON CONFLICT (tx_id) DO UPDATE SET
          recipient = COALESCE($2, consensus_transactions.recipient),
          activator = COALESCE($3, consensus_transactions.activator),
