@@ -231,37 +231,43 @@ export class Database {
   }
 
   // Atomically increment prime_count and add rewards (for ValidatorPrime)
+  // Uses upsert so primes arriving before ValidatorJoin are not lost
   async incrementValidatorPrime(address: string, rewards: string, epoch: bigint) {
     await this.pool.query(
-      `UPDATE validators SET
-        prime_count = prime_count + 1,
-        total_rewards = total_rewards + $2,
+      `INSERT INTO validators (address, prime_count, total_rewards, last_prime_epoch, updated_at)
+       VALUES ($1, 1, $2, $3, NOW())
+       ON CONFLICT (address) DO UPDATE SET
+        prime_count = validators.prime_count + 1,
+        total_rewards = validators.total_rewards + $2,
         last_prime_epoch = $3,
-        updated_at = NOW()
-       WHERE address = $1`,
+        updated_at = NOW()`,
       [address.toLowerCase(), rewards, epoch.toString()]
     );
   }
 
   // Atomically increment slash_count and add slashed amount (for ValidatorSlash/SlashedFromIdleness)
+  // Uses upsert so slashes arriving before ValidatorJoin are not lost
   async incrementValidatorSlash(address: string, slashedAmount: string) {
     await this.pool.query(
-      `UPDATE validators SET
-        slash_count = slash_count + 1,
-        total_slashed = total_slashed + $2,
-        updated_at = NOW()
-       WHERE address = $1`,
+      `INSERT INTO validators (address, slash_count, total_slashed, updated_at)
+       VALUES ($1, 1, $2, NOW())
+       ON CONFLICT (address) DO UPDATE SET
+        slash_count = validators.slash_count + 1,
+        total_slashed = validators.total_slashed + $2,
+        updated_at = NOW()`,
       [address.toLowerCase(), slashedAmount]
     );
   }
 
   // Atomically decrement validator stake (for ValidatorClaim withdrawal)
+  // Uses upsert so claims arriving before ValidatorJoin are not lost
   async decrementValidatorStake(address: string, amount: string) {
     await this.pool.query(
-      `UPDATE validators SET
-        total_stake = GREATEST(total_stake - $2, 0),
-        updated_at = NOW()
-       WHERE address = $1`,
+      `INSERT INTO validators (address, total_stake, updated_at)
+       VALUES ($1, 0, NOW())
+       ON CONFLICT (address) DO UPDATE SET
+        total_stake = GREATEST(validators.total_stake - $2, 0),
+        updated_at = NOW()`,
       [address.toLowerCase(), amount]
     );
   }
@@ -667,11 +673,11 @@ export class Database {
         -- Estimated APY based on actual elapsed time (first epoch timestamp to now)
         (SELECT CASE
           WHEN COALESCE(SUM(v.total_stake), 0) > 0
-            AND first_epoch.ts IS NOT NULL
-            AND EXTRACT(EPOCH FROM NOW() - first_epoch.ts) > 0
+            AND MAX(first_epoch.ts) IS NOT NULL
+            AND EXTRACT(EPOCH FROM NOW() - MAX(first_epoch.ts)) > 0
           THEN ROUND(
             COALESCE(SUM(v.total_rewards), 0) / GREATEST(SUM(v.total_stake), 1) *
-            (365.25 * 86400.0 / EXTRACT(EPOCH FROM NOW() - first_epoch.ts)) * 100, 2
+            (365.25 * 86400.0 / EXTRACT(EPOCH FROM NOW() - MAX(first_epoch.ts))) * 100, 2
           )
           ELSE 0
         END

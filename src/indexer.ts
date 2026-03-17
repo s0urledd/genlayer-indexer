@@ -39,7 +39,14 @@ export class Indexer {
   constructor(db: Database) {
     this.client = createPublicClient({
       chain: genlayerChain,
-      transport: http(config.rpcUrl),
+      transport: http(config.rpcUrl, {
+        timeout: config.rpcTimeoutMs,
+        retryCount: 5,
+        retryDelay: 3000,
+        fetchOptions: {
+          signal: AbortSignal.timeout(config.rpcTimeoutMs),
+        },
+      }),
     });
     this.db = db;
   }
@@ -671,6 +678,28 @@ export class Indexer {
       case "SetStakingInvariant":
         break;
 
+      case "SlashedFromIdleness": {
+        const validator = (args.validator as string).toLowerCase();
+        const percentage = args.percentage as string;
+
+        // Calculate slashed amount from percentage (basis points: 100 = 1%) and current stake
+        let slashAmount = "0";
+        if (percentage) {
+          const current = await this.db.getValidator(validator);
+          if (current?.total_stake) {
+            const stake = BigInt(current.total_stake);
+            const pct = BigInt(percentage);
+            slashAmount = ((stake * pct) / 10000n).toString();
+          }
+        }
+
+        await this.db.incrementValidatorSlash(validator, slashAmount);
+        await this.db.upsertValidator(validator, {
+          lastSeenBlock: blockNumber,
+        });
+        break;
+      }
+
       // Infrastructure events — stored in raw events table, no aggregation
       case "CreatedTransaction":
       case "TransactionFinalizationFailed":
@@ -687,29 +716,6 @@ export class Indexer {
         // Unknown event — already stored in raw events table
         console.warn(`Unhandled event: ${eventName}`);
         break;
-
-      case "SlashedFromIdleness": {
-        const validator = (args.validator as string).toLowerCase();
-        const percentage = args.percentage as string;
-
-        // Calculate slashed amount from percentage (basis points: 100 = 1%) and current stake
-        let slashAmount = "0";
-        if (percentage) {
-          const current = await this.db.getValidator(validator);
-          if (current?.total_stake) {
-            const stake = BigInt(current.total_stake);
-            const pct = BigInt(percentage);
-            slashAmount = ((stake * pct) / 10000n).toString();
-          }
-        }
-
-        // Atomic increment — no read-modify-write race
-        await this.db.incrementValidatorSlash(validator, slashAmount);
-        await this.db.upsertValidator(validator, {
-          lastSeenBlock: blockNumber,
-        });
-        break;
-      }
     }
   }
 

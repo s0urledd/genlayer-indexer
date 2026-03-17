@@ -3,6 +3,31 @@ import { URL } from "node:url";
 import { Database } from "./db/queries.js";
 import type { Indexer } from "./indexer.js";
 
+class ValidationError extends Error {
+  constructor(message: string) {
+    super(message);
+    this.name = "ValidationError";
+  }
+}
+
+/** Parse an integer query param, returning defaultVal if absent. Throws ValidationError if present but invalid. */
+function parseIntParam(params: URLSearchParams, name: string, defaultVal: number): number {
+  const raw = params.get(name);
+  if (raw === null) return defaultVal;
+  const val = parseInt(raw, 10);
+  if (isNaN(val) || val < 0) throw new ValidationError(`Invalid parameter '${name}': must be a non-negative integer`);
+  return val;
+}
+
+/** Parse a bigint from a path segment or query param. Throws ValidationError if invalid. */
+function parseBigInt(value: string, name: string): bigint {
+  try {
+    return BigInt(value);
+  } catch {
+    throw new ValidationError(`Invalid parameter '${name}': must be a valid integer`);
+  }
+}
+
 type RouteHandler = (
   params: URLSearchParams,
   pathParts: string[]
@@ -91,7 +116,7 @@ export class Api {
     // Per-epoch network uptime (% of validators that primed)
     // ──────────────────────────────────────────────────────────
     this.routes.set("GET /stats/network-uptime", async (params) => {
-      const epochCount = parseInt(params.get("epochs") || "30");
+      const epochCount = parseIntParam(params, "epochs", 30);
       return this.db.getNetworkUptimeByEpoch(epochCount);
     });
 
@@ -100,8 +125,8 @@ export class Api {
     // Network metrics time-series for dashboard charts
     // ──────────────────────────────────────────────────────────
     this.routes.set("GET /stats/timeline", async (params) => {
-      const hours = parseInt(params.get("hours") || "24");
-      const limit = parseInt(params.get("limit") || "200");
+      const hours = parseIntParam(params, "hours", 24);
+      const limit = parseIntParam(params, "limit", 200);
       return this.db.getMetricsTimeline(hours, limit);
     });
 
@@ -110,13 +135,13 @@ export class Api {
     // Event counts by hour and category
     // ──────────────────────────────────────────────────────────
     this.routes.set("GET /stats/event-activity", async (params) => {
-      const hours = parseInt(params.get("hours") || "24");
+      const hours = parseIntParam(params, "hours", 24);
       return this.db.getThroughputStats(hours);
     });
 
     // Keep old name as alias
     this.routes.set("GET /stats/throughput", async (params) => {
-      const hours = parseInt(params.get("hours") || "24");
+      const hours = parseIntParam(params, "hours", 24);
       return this.db.getThroughputStats(hours);
     });
 
@@ -152,8 +177,8 @@ export class Api {
         status: params.get("status") || undefined,
         sort: params.get("sort") || undefined,
         order: (params.get("order") as "asc" | "desc") || undefined,
-        limit: parseInt(params.get("limit") || "100"),
-        offset: parseInt(params.get("offset") || "0"),
+        limit: parseIntParam(params, "limit", 100),
+        offset: parseIntParam(params, "offset", 0),
       });
     });
 
@@ -164,8 +189,12 @@ export class Api {
     // ?limit=10
     // ──────────────────────────────────────────────────────────
     this.routes.set("GET /validators/top", async (params) => {
-      const sort = (params.get("sort") || "stake") as "stake" | "participation" | "rewards";
-      const limit = parseInt(params.get("limit") || "10");
+      const sortRaw = params.get("sort") || "stake";
+      if (!["stake", "participation", "rewards"].includes(sortRaw)) {
+        throw new ValidationError("Invalid sort: must be one of stake, participation, rewards");
+      }
+      const sort = sortRaw as "stake" | "participation" | "rewards";
+      const limit = parseIntParam(params, "limit", 10);
       return this.db.getTopValidators(sort, limit);
     });
 
@@ -186,8 +215,8 @@ export class Api {
     // ──────────────────────────────────────────────────────────
     this.routes.set("GET /validators/:address/history", async (params, parts) => {
       const address = parts[2];
-      const limit = parseInt(params.get("limit") || "50");
-      const offset = parseInt(params.get("offset") || "0");
+      const limit = parseIntParam(params, "limit", 50);
+      const offset = parseIntParam(params, "offset", 0);
       return this.db.getValidatorHistory(address, limit, offset);
     });
 
@@ -197,7 +226,7 @@ export class Api {
     // ──────────────────────────────────────────────────────────
     this.routes.set("GET /validators/:address/uptime", async (params, parts) => {
       const address = parts[2];
-      const epochCount = parseInt(params.get("epochs") || "30");
+      const epochCount = parseIntParam(params, "epochs", 30);
       const uptimeData = await this.db.getValidatorUptimeByEpoch(address, epochCount);
       const totalEpochs = uptimeData.length;
       const primedEpochs = uptimeData.filter((e) => e.primed).length;
@@ -220,7 +249,7 @@ export class Api {
     // ──────────────────────────────────────────────────────────
     this.routes.set("GET /validators/:address/participation-history", async (params, parts) => {
       const address = parts[2];
-      const epochCount = parseInt(params.get("epochs") || "30");
+      const epochCount = parseIntParam(params, "epochs", 30);
       return this.db.getValidatorParticipationHistory(address, epochCount);
     });
 
@@ -230,7 +259,7 @@ export class Api {
     // ──────────────────────────────────────────────────────────
     this.routes.set("GET /validators/:address/reward-history", async (params, parts) => {
       const address = parts[2];
-      const limit = parseInt(params.get("limit") || "50");
+      const limit = parseIntParam(params, "limit", 50);
       return this.db.getValidatorRewardHistory(address, limit);
     });
 
@@ -240,7 +269,7 @@ export class Api {
     // ──────────────────────────────────────────────────────────
     this.routes.set("GET /validators/:address/slash-history", async (params, parts) => {
       const address = parts[2];
-      const limit = parseInt(params.get("limit") || "50");
+      const limit = parseIntParam(params, "limit", 50);
       return this.db.getValidatorSlashHistory(address, limit);
     });
 
@@ -253,8 +282,8 @@ export class Api {
         const address = parts[2];
         return this.db.getDelegations({
           validator: address,
-          limit: parseInt(params.get("limit") || "100"),
-          offset: parseInt(params.get("offset") || "0"),
+          limit: parseIntParam(params, "limit", 100),
+          offset: parseIntParam(params, "offset", 0),
         });
       }
     );
@@ -267,8 +296,8 @@ export class Api {
       "GET /validators/:address/transactions",
       async (params, parts) => {
         const address = parts[2];
-        const limit = parseInt(params.get("limit") || "50");
-        const offset = parseInt(params.get("offset") || "0");
+        const limit = parseIntParam(params, "limit", 50);
+        const offset = parseIntParam(params, "offset", 0);
         const detail = params.get("detail");
         if (detail === "full") {
           return this.db.getConsensusTxForValidator(address, limit, offset);
@@ -289,8 +318,8 @@ export class Api {
     // ──────────────────────────────────────────────────────────
     this.routes.set("GET /epochs", async (params) => {
       return this.db.getEpochs(
-        parseInt(params.get("limit") || "50"),
-        parseInt(params.get("offset") || "0")
+        parseIntParam(params, "limit", 50),
+        parseIntParam(params, "offset", 0)
       );
     });
 
@@ -298,7 +327,7 @@ export class Api {
     // GET /epochs/:epoch
     // ──────────────────────────────────────────────────────────
     this.routes.set("GET /epochs/:epoch", async (_params, parts) => {
-      const epoch = BigInt(parts[2]);
+      const epoch = parseBigInt(parts[2], "epoch");
       const epochData = await this.db.getEpoch(epoch);
       if (!epochData) return { error: "Epoch not found" };
       return epochData;
@@ -308,7 +337,7 @@ export class Api {
     // GET /epochs/durations
     // ──────────────────────────────────────────────────────────
     this.routes.set("GET /epochs/durations", async (params) => {
-      const limit = parseInt(params.get("limit") || "50");
+      const limit = parseIntParam(params, "limit", 50);
       return this.db.getEpochDurations(limit);
     });
 
@@ -323,12 +352,12 @@ export class Api {
         eventName: params.get("event_name") || undefined,
         category: params.get("category") || undefined,
         validator: params.get("validator") || undefined,
-        fromBlock: fromBlock ? BigInt(fromBlock) : undefined,
-        toBlock: toBlock ? BigInt(toBlock) : undefined,
+        fromBlock: fromBlock ? parseBigInt(fromBlock, "from_block") : undefined,
+        toBlock: toBlock ? parseBigInt(toBlock, "to_block") : undefined,
         sort: params.get("sort") || undefined,
         order: (params.get("order") as "asc" | "desc") || undefined,
-        limit: parseInt(params.get("limit") || "100"),
-        offset: parseInt(params.get("offset") || "0"),
+        limit: parseIntParam(params, "limit", 100),
+        offset: parseIntParam(params, "offset", 0),
       });
     });
 
@@ -337,8 +366,8 @@ export class Api {
     // Normalized, UI-ready event stream for "recent activity" card
     // ──────────────────────────────────────────────────────────
     this.routes.set("GET /events/feed", async (params) => {
-      const limit = parseInt(params.get("limit") || "50");
-      const offset = parseInt(params.get("offset") || "0");
+      const limit = parseIntParam(params, "limit", 50);
+      const offset = parseIntParam(params, "offset", 0);
       return this.db.getEventFeed(limit, offset);
     });
 
@@ -347,7 +376,7 @@ export class Api {
     // Recent slashing events
     // ──────────────────────────────────────────────────────────
     this.routes.set("GET /events/slashes", async (params) => {
-      return this.db.getRecentSlashes(parseInt(params.get("limit") || "20"));
+      return this.db.getRecentSlashes(parseIntParam(params, "limit", 20));
     });
 
     // ──────────────────────────────────────────────────────────
@@ -357,8 +386,8 @@ export class Api {
       return this.db.getDelegations({
         validator: params.get("validator") || undefined,
         delegator: params.get("delegator") || undefined,
-        limit: parseInt(params.get("limit") || "100"),
-        offset: parseInt(params.get("offset") || "0"),
+        limit: parseIntParam(params, "limit", 100),
+        offset: parseIntParam(params, "offset", 0),
       });
     });
   }
@@ -424,6 +453,11 @@ export class Api {
       const result = await handler(params, ["", ...pathParts]);
       this.sendJson(res, 200, result);
     } catch (err) {
+      // Distinguish client errors (bad input) from server errors
+      if (err instanceof ValidationError) {
+        this.sendJson(res, 400, { error: err.message });
+        return;
+      }
       console.error("API error:", err);
       this.sendJson(res, 500, { error: "Internal server error" });
     }

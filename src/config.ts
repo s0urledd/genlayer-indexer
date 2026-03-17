@@ -17,4 +17,5 @@ export const config = {
   pollIntervalMs: parseInt(process.env.POLL_INTERVAL_MS || "5000"),
   startBlock: BigInt(process.env.START_BLOCK || "0"),
   apiPort: parseInt(process.env.API_PORT || "3000"),
+  rpcTimeoutMs: parseInt(process.env.RPC_TIMEOUT_MS || "60000"),
 };
