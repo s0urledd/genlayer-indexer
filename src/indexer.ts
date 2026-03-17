@@ -39,14 +39,7 @@ export class Indexer {
   constructor(db: Database) {
     this.client = createPublicClient({
       chain: genlayerChain,
-      transport: http(config.rpcUrl, {
-        timeout: config.rpcTimeoutMs,
-        retryCount: 5,
-        retryDelay: 3000,
-        fetchOptions: {
-          signal: AbortSignal.timeout(config.rpcTimeoutMs),
-        },
-      }),
+      transport: http(config.rpcUrl),
     });
     this.db = db;
   }
