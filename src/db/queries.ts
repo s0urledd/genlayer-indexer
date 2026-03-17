@@ -1,5 +1,5 @@
 import pg from "pg";
-import { EVENT_CATEGORIES } from "../abi.js";
+import { EVENT_CATEGORIES, VOTE_TYPES, TX_STATUSES } from "../abi.js";
 
 export class Database {
   private pool: pg.Pool;
@@ -245,6 +245,138 @@ export class Database {
         withdrawDelta,
       ]
     );
+  }
+
+  // ============================================================
+  // Consensus Transaction Aggregation
+  // ============================================================
+
+  async upsertConsensusTx(txId: string, data: Partial<{
+    recipient: string;
+    activator: string;
+    leader: string;
+    status: string;
+    voteType: string;
+    resultType: string;
+    rotationCount: number;
+    appealCount: number;
+    validators: string[];
+    createdAtBlock: bigint;
+    createdAtTimestamp: Date;
+    acceptedAtBlock: bigint;
+    finalizedAtBlock: bigint;
+  }>) {
+    await this.pool.query(
+      `INSERT INTO consensus_transactions (tx_id, recipient, activator, leader, status, vote_type, result_type, rotation_count, appeal_count, validators, created_at_block, created_at_timestamp, accepted_at_block, finalized_at_block, updated_at)
+       VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, NOW())
+       ON CONFLICT (tx_id) DO UPDATE SET
+         recipient = COALESCE($2, consensus_transactions.recipient),
+         activator = COALESCE($3, consensus_transactions.activator),
+         leader = COALESCE($4, consensus_transactions.leader),
+         status = COALESCE($5, consensus_transactions.status),
+         vote_type = COALESCE($6, consensus_transactions.vote_type),
+         result_type = COALESCE($7, consensus_transactions.result_type),
+         rotation_count = COALESCE($8, consensus_transactions.rotation_count),
+         appeal_count = COALESCE($9, consensus_transactions.appeal_count),
+         validators = COALESCE($10, consensus_transactions.validators),
+         created_at_block = COALESCE($11, consensus_transactions.created_at_block),
+         created_at_timestamp = COALESCE($12, consensus_transactions.created_at_timestamp),
+         accepted_at_block = COALESCE($13, consensus_transactions.accepted_at_block),
+         finalized_at_block = COALESCE($14, consensus_transactions.finalized_at_block),
+         updated_at = NOW()`,
+      [
+        txId,
+        data.recipient?.toLowerCase() || null,
+        data.activator?.toLowerCase() || null,
+        data.leader?.toLowerCase() || null,
+        data.status || null,
+        data.voteType || null,
+        data.resultType || null,
+        data.rotationCount ?? null,
+        data.appealCount ?? null,
+        data.validators ? `{${data.validators.map(v => v.toLowerCase()).join(",")}}` : null,
+        data.createdAtBlock?.toString() || null,
+        data.createdAtTimestamp || null,
+        data.acceptedAtBlock?.toString() || null,
+        data.finalizedAtBlock?.toString() || null,
+      ]
+    );
+  }
+
+  async incrementConsensusTxRotation(txId: string) {
+    await this.pool.query(
+      `UPDATE consensus_transactions SET rotation_count = rotation_count + 1, updated_at = NOW() WHERE tx_id = $1`,
+      [txId]
+    );
+  }
+
+  async incrementConsensusTxAppeal(txId: string) {
+    await this.pool.query(
+      `UPDATE consensus_transactions SET appeal_count = appeal_count + 1, updated_at = NOW() WHERE tx_id = $1`,
+      [txId]
+    );
+  }
+
+  async upsertValidatorTxParticipation(txId: string, validator: string, data: Partial<{
+    role: string;
+    voteType: string;
+    voteCommitted: boolean;
+    voteRevealed: boolean;
+    blockNumber: bigint;
+  }>) {
+    await this.pool.query(
+      `INSERT INTO validator_tx_participation (tx_id, validator, role, vote_type, vote_committed, vote_revealed, block_number, updated_at)
+       VALUES ($1, $2, $3, $4, $5, $6, $7, NOW())
+       ON CONFLICT (tx_id, validator) DO UPDATE SET
+         role = COALESCE($3, validator_tx_participation.role),
+         vote_type = COALESCE($4, validator_tx_participation.vote_type),
+         vote_committed = COALESCE($5, validator_tx_participation.vote_committed),
+         vote_revealed = COALESCE($6, validator_tx_participation.vote_revealed),
+         block_number = COALESCE($7, validator_tx_participation.block_number),
+         updated_at = NOW()`,
+      [
+        txId,
+        validator.toLowerCase(),
+        data.role || null,
+        data.voteType || null,
+        data.voteCommitted ?? null,
+        data.voteRevealed ?? null,
+        data.blockNumber?.toString() || null,
+      ]
+    );
+  }
+
+  // ============================================================
+  // Consensus Transaction Queries
+  // ============================================================
+
+  async getConsensusTxForValidator(validator: string, limit = 50, offset = 0) {
+    const result = await this.pool.query(
+      `SELECT ct.*, vtp.role, vtp.vote_type as validator_vote_type,
+         vtp.vote_committed, vtp.vote_revealed
+       FROM consensus_transactions ct
+       INNER JOIN validator_tx_participation vtp ON vtp.tx_id = ct.tx_id
+       WHERE vtp.validator = $1
+       ORDER BY ct.created_at_block DESC NULLS LAST
+       LIMIT $2 OFFSET $3`,
+      [validator.toLowerCase(), limit, offset]
+    );
+    return result.rows;
+  }
+
+  async getConsensusTxStats() {
+    const result = await this.pool.query(`
+      SELECT
+        COUNT(*) as total_transactions,
+        COUNT(*) FILTER (WHERE status = 'accepted') as accepted,
+        COUNT(*) FILTER (WHERE status = 'finalized') as finalized,
+        COUNT(*) FILTER (WHERE status = 'undetermined') as undetermined,
+        COUNT(*) FILTER (WHERE status = 'cancelled') as cancelled,
+        COUNT(*) FILTER (WHERE status NOT IN ('accepted', 'finalized', 'undetermined', 'cancelled')) as in_progress,
+        COALESCE(AVG(rotation_count), 0) as avg_rotations,
+        COALESCE(AVG(appeal_count), 0) as avg_appeals
+    `);
+    return result.rows[0];
   }
 
   // ============================================================

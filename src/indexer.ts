@@ -6,7 +6,7 @@ import {
   decodeEventLog,
 } from "viem";
 import { config } from "./config.js";
-import { STAKING_EVENTS_ABI, SLASHING_EVENTS_ABI, EVENT_CATEGORIES } from "./abi.js";
+import { STAKING_EVENTS_ABI, SLASHING_EVENTS_ABI, CONSENSUS_EVENTS_ABI, EVENT_CATEGORIES, VOTE_TYPES, TX_STATUSES } from "./abi.js";
 import { Database } from "./db/queries.js";
 
 // Build a custom chain definition for GenLayer
@@ -81,7 +81,7 @@ export class Indexer {
       ),
       this.indexContract(
         config.consensusContract,
-        SLASHING_EVENTS_ABI as unknown as AbiEvent[],
+        [...SLASHING_EVENTS_ABI, ...CONSENSUS_EVENTS_ABI] as unknown as AbiEvent[],
         currentBlock
       ),
     ]);
@@ -443,6 +443,189 @@ export class Indexer {
         await this.db.upsertDelegation(validator, delegator, "0", amount);
         break;
       }
+
+      // ============================================================
+      // Consensus Contract Events
+      // ============================================================
+
+      case "NewTransaction": {
+        const txId = args.txId as string;
+        const recipient = args.recipient as string;
+        const activator = args.activator as string;
+        await this.db.upsertConsensusTx(txId, {
+          recipient,
+          activator,
+          status: "pending",
+          createdAtBlock: blockNumber,
+          createdAtTimestamp: event.blockTimestamp,
+        });
+        break;
+      }
+
+      case "TransactionActivated": {
+        const txId = args.txId as string;
+        const leader = args.leader as string;
+        await this.db.upsertConsensusTx(txId, {
+          leader,
+          status: "proposing",
+        });
+        // Leader participates with role "leader"
+        await this.db.upsertValidatorTxParticipation(txId, leader, {
+          role: "leader",
+          blockNumber,
+        });
+        break;
+      }
+
+      case "TransactionReceiptProposed": {
+        const txId = args.txId as string;
+        const validators = args.validators as string[];
+        await this.db.upsertConsensusTx(txId, {
+          status: "committing",
+          validators,
+        });
+        // Register all validators as participants
+        for (const v of validators) {
+          await this.db.upsertValidatorTxParticipation(txId, v, {
+            role: "validator",
+            blockNumber,
+          });
+        }
+        break;
+      }
+
+      case "VoteCommitted": {
+        const txId = args.txId as string;
+        const validator = args.validator as string;
+        await this.db.upsertValidatorTxParticipation(txId, validator, {
+          voteCommitted: true,
+          blockNumber,
+        });
+        break;
+      }
+
+      case "VoteRevealed": {
+        const txId = args.txId as string;
+        const validator = args.validator as string;
+        const voteTypeNum = parseInt(args.voteType as string);
+        const voteType = VOTE_TYPES[voteTypeNum] || `UNKNOWN_${voteTypeNum}`;
+        await this.db.upsertValidatorTxParticipation(txId, validator, {
+          voteRevealed: true,
+          voteType,
+          blockNumber,
+        });
+        await this.db.upsertConsensusTx(txId, { voteType });
+        break;
+      }
+
+      case "AllVotesCommitted": {
+        const txId = args.txId as string;
+        const statusNum = parseInt(args.newStatus as string);
+        const status = TX_STATUSES[statusNum]?.toLowerCase() || "committing";
+        await this.db.upsertConsensusTx(txId, { status });
+        break;
+      }
+
+      case "TransactionAccepted": {
+        const txId = args.txId as string;
+        await this.db.upsertConsensusTx(txId, {
+          status: "accepted",
+          acceptedAtBlock: blockNumber,
+        });
+        break;
+      }
+
+      case "TransactionFinalized": {
+        const txId = args.txId as string;
+        await this.db.upsertConsensusTx(txId, {
+          status: "finalized",
+          finalizedAtBlock: blockNumber,
+        });
+        break;
+      }
+
+      case "TransactionUndetermined": {
+        const txId = args.txId as string;
+        await this.db.upsertConsensusTx(txId, { status: "undetermined" });
+        break;
+      }
+
+      case "TransactionCancelled": {
+        const txId = args.txId as string;
+        await this.db.upsertConsensusTx(txId, { status: "cancelled" });
+        break;
+      }
+
+      case "TransactionLeaderRotated": {
+        const txId = args.txId as string;
+        const newLeader = args.newLeader as string;
+        await this.db.upsertConsensusTx(txId, { leader: newLeader });
+        await this.db.incrementConsensusTxRotation(txId);
+        await this.db.upsertValidatorTxParticipation(txId, newLeader, {
+          role: "leader",
+          blockNumber,
+        });
+        break;
+      }
+
+      case "TransactionLeaderTimeout":
+      case "LeaderIdlenessProcessed":
+      case "ProcessIdlenessAccepted": {
+        // These are tracked via raw events, no extra aggregation needed
+        break;
+      }
+
+      case "AppealStarted": {
+        const txId = args.txId as string;
+        await this.db.incrementConsensusTxAppeal(txId);
+        break;
+      }
+
+      case "TribunalAppealVoteCommitted": {
+        const txId = args.txId as string;
+        const validator = args.validator as string;
+        await this.db.upsertValidatorTxParticipation(txId, validator, {
+          role: "appeal_validator",
+          voteCommitted: true,
+          blockNumber,
+        });
+        break;
+      }
+
+      case "TribunalAppealVoteRevealed": {
+        const txId = args.txId as string;
+        const validator = args.validator as string;
+        const voteTypeNum = parseInt(args.voteType as string);
+        const voteType = VOTE_TYPES[voteTypeNum] || `UNKNOWN_${voteTypeNum}`;
+        await this.db.upsertValidatorTxParticipation(txId, validator, {
+          voteRevealed: true,
+          voteType,
+          blockNumber,
+        });
+        break;
+      }
+
+      case "ValidatorReplaced": {
+        const txId = args.txId as string;
+        const newValidator = args.newValidator as string;
+        await this.db.upsertValidatorTxParticipation(txId, newValidator, {
+          role: "validator",
+          blockNumber,
+        });
+        break;
+      }
+
+      // Infrastructure events - stored in raw events table, no aggregation
+      case "CreatedTransaction":
+      case "TransactionFinalizationFailed":
+      case "TransactionNeedsRecomputation":
+      case "TransactionLeaderRevealed":
+      case "BatchFinalizationCompleted":
+      case "InternalMessageProcessed":
+      case "ValueWithdrawalFailed":
+      case "ActivatorReplaced":
+      case "AddressManagerSet":
+        break;
 
       case "SlashedFromIdleness": {
         const validator = (args.validator as string).toLowerCase();
