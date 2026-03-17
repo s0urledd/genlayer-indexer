@@ -22,25 +22,31 @@ export class Api {
     this.server.listen(port, () => {
       console.log(`API server listening on http://localhost:${port}`);
       console.log("Available endpoints:");
-      console.log("  GET /health                          - Health check");
-      console.log("  GET /stats                           - Network overview stats");
-      console.log("  GET /stats/network-uptime             - Per-epoch network uptime");
-      console.log("  GET /stats/timeline                  - Historical metrics time-series");
-      console.log("  GET /stats/throughput                - Event throughput by hour");
-      console.log("  GET /stats/latency                   - Live RPC latency metrics");
-      console.log("  GET /validators                      - List all validators");
-      console.log("  GET /validators/:address             - Single validator details");
-      console.log("  GET /validators/:address/history     - Validator event history");
-      console.log("  GET /validators/:address/uptime      - Epoch-by-epoch uptime");
-      console.log("  GET /validators/:address/delegations - Delegations for validator");
-      console.log("  GET /validators/:address/transactions - Consensus tx participation");
-      console.log("  GET /consensus/stats                 - Consensus transaction stats");
-      console.log("  GET /epochs                          - List epochs");
-      console.log("  GET /epochs/:epoch                   - Single epoch details");
-      console.log("  GET /epochs/durations                - Epoch duration analysis");
-      console.log("  GET /events                          - Query all events");
-      console.log("  GET /events/slashes                  - Recent slashing events");
-      console.log("  GET /delegations                     - Query delegations");
+      console.log("  GET /health");
+      console.log("  GET /stats");
+      console.log("  GET /stats/summary");
+      console.log("  GET /stats/network-uptime");
+      console.log("  GET /stats/timeline");
+      console.log("  GET /stats/event-activity");
+      console.log("  GET /stats/rpc-latency");
+      console.log("  GET /validators");
+      console.log("  GET /validators/top");
+      console.log("  GET /validators/:address");
+      console.log("  GET /validators/:address/history");
+      console.log("  GET /validators/:address/uptime");
+      console.log("  GET /validators/:address/delegations");
+      console.log("  GET /validators/:address/transactions");
+      console.log("  GET /validators/:address/participation-history");
+      console.log("  GET /validators/:address/reward-history");
+      console.log("  GET /validators/:address/slash-history");
+      console.log("  GET /consensus/stats");
+      console.log("  GET /epochs");
+      console.log("  GET /epochs/:epoch");
+      console.log("  GET /epochs/durations");
+      console.log("  GET /events");
+      console.log("  GET /events/feed");
+      console.log("  GET /events/slashes");
+      console.log("  GET /delegations");
     });
   }
 
@@ -51,7 +57,6 @@ export class Api {
   private registerRoutes() {
     // ──────────────────────────────────────────────────────────
     // GET /health
-    // Returns indexer health status
     // ──────────────────────────────────────────────────────────
     this.routes.set("GET /health", async () => ({
       status: "ok",
@@ -60,44 +65,120 @@ export class Api {
 
     // ──────────────────────────────────────────────────────────
     // GET /stats
-    // Network overview: validator counts, total staked, latest epoch, etc.
+    // Full network overview (kept for backward compat)
     // ──────────────────────────────────────────────────────────
     this.routes.set("GET /stats", async () => {
       return this.db.getNetworkStats();
     });
 
     // ──────────────────────────────────────────────────────────
+    // GET /stats/summary
+    // Dashboard top bar — single request for all key metrics
+    // ──────────────────────────────────────────────────────────
+    this.routes.set("GET /stats/summary", async () => {
+      const rpcLatency = this.indexer
+        ? this.indexer.getLatencyStats().rpcPing
+        : undefined;
+      return this.db.getDashboardSummary(rpcLatency);
+    });
+
+    // ──────────────────────────────────────────────────────────
+    // GET /stats/network-uptime
+    // Per-epoch network uptime (% of validators that primed)
+    // ──────────────────────────────────────────────────────────
+    this.routes.set("GET /stats/network-uptime", async (params) => {
+      const epochCount = parseInt(params.get("epochs") || "30");
+      return this.db.getNetworkUptimeByEpoch(epochCount);
+    });
+
+    // ──────────────────────────────────────────────────────────
+    // GET /stats/timeline
+    // Network metrics time-series for dashboard charts
+    // ──────────────────────────────────────────────────────────
+    this.routes.set("GET /stats/timeline", async (params) => {
+      const hours = parseInt(params.get("hours") || "24");
+      const limit = parseInt(params.get("limit") || "200");
+      return this.db.getMetricsTimeline(hours, limit);
+    });
+
+    // ──────────────────────────────────────────────────────────
+    // GET /stats/event-activity  (renamed from throughput)
+    // Event counts by hour and category
+    // ──────────────────────────────────────────────────────────
+    this.routes.set("GET /stats/event-activity", async (params) => {
+      const hours = parseInt(params.get("hours") || "24");
+      return this.db.getThroughputStats(hours);
+    });
+
+    // Keep old name as alias
+    this.routes.set("GET /stats/throughput", async (params) => {
+      const hours = parseInt(params.get("hours") || "24");
+      return this.db.getThroughputStats(hours);
+    });
+
+    // ──────────────────────────────────────────────────────────
+    // GET /stats/rpc-latency  (renamed from latency)
+    // Live RPC ping + log fetch duration from the indexer
+    // ──────────────────────────────────────────────────────────
+    this.routes.set("GET /stats/rpc-latency", async () => {
+      if (!this.indexer) {
+        return { error: "Indexer not connected" };
+      }
+      return this.indexer.getLatencyStats();
+    });
+
+    // Keep old name as alias
+    this.routes.set("GET /stats/latency", async () => {
+      if (!this.indexer) {
+        return { error: "Indexer not connected" };
+      }
+      return this.indexer.getLatencyStats();
+    });
+
+    // ──────────────────────────────────────────────────────────
     // GET /validators
-    // List all validators, ordered by stake descending
-    // Query params:
-    //   ?status=active|banned|quarantined|exiting
-    //   ?limit=100  (default 100)
-    //   ?offset=0   (default 0)
+    // List all validators with sort/order support
+    // ?status=active|banned|quarantined|exiting
+    // ?sort=total_stake|participation_score|total_rewards|...
+    // ?order=asc|desc
+    // ?limit=100  ?offset=0
     // ──────────────────────────────────────────────────────────
     this.routes.set("GET /validators", async (params) => {
-      return this.db.getValidators({
+      return this.db.getValidatorsSorted({
         status: params.get("status") || undefined,
+        sort: params.get("sort") || undefined,
+        order: (params.get("order") as "asc" | "desc") || undefined,
         limit: parseInt(params.get("limit") || "100"),
         offset: parseInt(params.get("offset") || "0"),
       });
     });
 
     // ──────────────────────────────────────────────────────────
+    // GET /validators/top
+    // Top N validators by stake, participation, or rewards
+    // ?sort=stake|participation|rewards  (default: stake)
+    // ?limit=10
+    // ──────────────────────────────────────────────────────────
+    this.routes.set("GET /validators/top", async (params) => {
+      const sort = (params.get("sort") || "stake") as "stake" | "participation" | "rewards";
+      const limit = parseInt(params.get("limit") || "10");
+      return this.db.getTopValidators(sort, limit);
+    });
+
+    // ──────────────────────────────────────────────────────────
     // GET /validators/:address
-    // Single validator details: stake, rewards, slash count, status
+    // Enriched single validator detail
     // ──────────────────────────────────────────────────────────
     this.routes.set("GET /validators/:address", async (_params, parts) => {
-      const address = parts[2]; // /validators/0x...
-      const validator = await this.db.getValidator(address);
+      const address = parts[2];
+      const validator = await this.db.getValidatorEnriched(address);
       if (!validator) return { error: "Validator not found" };
       return validator;
     });
 
     // ──────────────────────────────────────────────────────────
     // GET /validators/:address/history
-    // All events related to this validator, most recent first
-    // Query params:
-    //   ?limit=50  (default 50)
+    // All events related to this validator
     // ──────────────────────────────────────────────────────────
     this.routes.set("GET /validators/:address/history", async (params, parts) => {
       const address = parts[2];
@@ -107,9 +188,7 @@ export class Api {
 
     // ──────────────────────────────────────────────────────────
     // GET /validators/:address/uptime
-    // Epoch-by-epoch prime/miss status for uptime visualization
-    // Query params:
-    //   ?epochs=30  (default 30, how many epochs to look back)
+    // Epoch-by-epoch prime/miss (technical, secondary metric)
     // ──────────────────────────────────────────────────────────
     this.routes.set("GET /validators/:address/uptime", async (params, parts) => {
       const address = parts[2];
@@ -131,11 +210,37 @@ export class Api {
     });
 
     // ──────────────────────────────────────────────────────────
+    // GET /validators/:address/participation-history
+    // Chart-friendly per-epoch participation data
+    // ──────────────────────────────────────────────────────────
+    this.routes.set("GET /validators/:address/participation-history", async (params, parts) => {
+      const address = parts[2];
+      const epochCount = parseInt(params.get("epochs") || "30");
+      return this.db.getValidatorParticipationHistory(address, epochCount);
+    });
+
+    // ──────────────────────────────────────────────────────────
+    // GET /validators/:address/reward-history
+    // Chart-friendly per-epoch reward breakdown
+    // ──────────────────────────────────────────────────────────
+    this.routes.set("GET /validators/:address/reward-history", async (params, parts) => {
+      const address = parts[2];
+      const limit = parseInt(params.get("limit") || "50");
+      return this.db.getValidatorRewardHistory(address, limit);
+    });
+
+    // ──────────────────────────────────────────────────────────
+    // GET /validators/:address/slash-history
+    // Timeline of slashes, quarantines, bans
+    // ──────────────────────────────────────────────────────────
+    this.routes.set("GET /validators/:address/slash-history", async (params, parts) => {
+      const address = parts[2];
+      const limit = parseInt(params.get("limit") || "50");
+      return this.db.getValidatorSlashHistory(address, limit);
+    });
+
+    // ──────────────────────────────────────────────────────────
     // GET /validators/:address/delegations
-    // Delegations for a specific validator
-    // Query params:
-    //   ?limit=100  (default 100)
-    //   ?offset=0   (default 0)
     // ──────────────────────────────────────────────────────────
     this.routes.set(
       "GET /validators/:address/delegations",
@@ -150,11 +255,32 @@ export class Api {
     );
 
     // ──────────────────────────────────────────────────────────
+    // GET /validators/:address/transactions
+    // Default: compact mode. ?detail=full for all fields.
+    // ──────────────────────────────────────────────────────────
+    this.routes.set(
+      "GET /validators/:address/transactions",
+      async (params, parts) => {
+        const address = parts[2];
+        const limit = parseInt(params.get("limit") || "50");
+        const offset = parseInt(params.get("offset") || "0");
+        const detail = params.get("detail");
+        if (detail === "full") {
+          return this.db.getConsensusTxForValidator(address, limit, offset);
+        }
+        return this.db.getConsensusTxForValidatorCompact(address, limit, offset);
+      }
+    );
+
+    // ──────────────────────────────────────────────────────────
+    // GET /consensus/stats
+    // ──────────────────────────────────────────────────────────
+    this.routes.set("GET /consensus/stats", async () => {
+      return this.db.getConsensusTxStats();
+    });
+
+    // ──────────────────────────────────────────────────────────
     // GET /epochs
-    // List epochs, most recent first
-    // Query params:
-    //   ?limit=50   (default 50)
-    //   ?offset=0   (default 0)
     // ──────────────────────────────────────────────────────────
     this.routes.set("GET /epochs", async (params) => {
       return this.db.getEpochs(
@@ -165,7 +291,6 @@ export class Api {
 
     // ──────────────────────────────────────────────────────────
     // GET /epochs/:epoch
-    // Single epoch details
     // ──────────────────────────────────────────────────────────
     this.routes.set("GET /epochs/:epoch", async (_params, parts) => {
       const epoch = BigInt(parts[2]);
@@ -175,39 +300,46 @@ export class Api {
     });
 
     // ──────────────────────────────────────────────────────────
+    // GET /epochs/durations
+    // ──────────────────────────────────────────────────────────
+    this.routes.set("GET /epochs/durations", async (params) => {
+      const limit = parseInt(params.get("limit") || "50");
+      return this.db.getEpochDurations(limit);
+    });
+
+    // ──────────────────────────────────────────────────────────
     // GET /events
-    // Query all indexed events with filters
-    // Query params:
-    //   ?event_name=ValidatorPrime    (filter by event name)
-    //   ?category=slashing            (filter by category)
-    //   ?validator=0x...              (filter by validator address in args)
-    //   ?from_block=1000              (filter by min block number)
-    //   ?to_block=2000                (filter by max block number)
-    //   ?limit=100                    (default 100)
-    //   ?offset=0                     (default 0)
-    //
-    // Categories: validator_lifecycle, delegator_lifecycle, slashing,
-    //             quarantine, epoch, economics, governance
+    // Full event query with sort/order support
     // ──────────────────────────────────────────────────────────
     this.routes.set("GET /events", async (params) => {
       const fromBlock = params.get("from_block");
       const toBlock = params.get("to_block");
-      return this.db.getEvents({
+      return this.db.getEventsSorted({
         eventName: params.get("event_name") || undefined,
         category: params.get("category") || undefined,
         validator: params.get("validator") || undefined,
         fromBlock: fromBlock ? BigInt(fromBlock) : undefined,
         toBlock: toBlock ? BigInt(toBlock) : undefined,
+        sort: params.get("sort") || undefined,
+        order: (params.get("order") as "asc" | "desc") || undefined,
         limit: parseInt(params.get("limit") || "100"),
         offset: parseInt(params.get("offset") || "0"),
       });
     });
 
     // ──────────────────────────────────────────────────────────
+    // GET /events/feed
+    // Normalized, UI-ready event stream for "recent activity" card
+    // ──────────────────────────────────────────────────────────
+    this.routes.set("GET /events/feed", async (params) => {
+      const limit = parseInt(params.get("limit") || "50");
+      const offset = parseInt(params.get("offset") || "0");
+      return this.db.getEventFeed(limit, offset);
+    });
+
+    // ──────────────────────────────────────────────────────────
     // GET /events/slashes
-    // Recent slashing events (shortcut for ?category=slashing)
-    // Query params:
-    //   ?limit=20  (default 20)
+    // Recent slashing events
     // ──────────────────────────────────────────────────────────
     this.routes.set("GET /events/slashes", async (params) => {
       return this.db.getRecentSlashes(parseInt(params.get("limit") || "20"));
@@ -215,12 +347,6 @@ export class Api {
 
     // ──────────────────────────────────────────────────────────
     // GET /delegations
-    // Query delegations across all validators
-    // Query params:
-    //   ?validator=0x...   (filter by validator)
-    //   ?delegator=0x...   (filter by delegator)
-    //   ?limit=100         (default 100)
-    //   ?offset=0          (default 0)
     // ──────────────────────────────────────────────────────────
     this.routes.set("GET /delegations", async (params) => {
       return this.db.getDelegations({
@@ -229,88 +355,6 @@ export class Api {
         limit: parseInt(params.get("limit") || "100"),
         offset: parseInt(params.get("offset") || "0"),
       });
-    });
-
-    // ──────────────────────────────────────────────────────────
-    // GET /validators/:address/transactions
-    // Consensus transactions this validator participated in
-    // Query params:
-    //   ?limit=50   (default 50)
-    //   ?offset=0   (default 0)
-    // ──────────────────────────────────────────────────────────
-    this.routes.set(
-      "GET /validators/:address/transactions",
-      async (params, parts) => {
-        const address = parts[2];
-        const limit = parseInt(params.get("limit") || "50");
-        const offset = parseInt(params.get("offset") || "0");
-        return this.db.getConsensusTxForValidator(address, limit, offset);
-      }
-    );
-
-    // ──────────────────────────────────────────────────────────
-    // GET /consensus/stats
-    // Consensus transaction statistics
-    // ──────────────────────────────────────────────────────────
-    this.routes.set("GET /consensus/stats", async () => {
-      return this.db.getConsensusTxStats();
-    });
-
-    // ──────────────────────────────────────────────────────────
-    // GET /stats/network-uptime
-    // Per-epoch network uptime (% of validators that primed)
-    // Query params:
-    //   ?epochs=30  (default 30)
-    // ──────────────────────────────────────────────────────────
-    this.routes.set("GET /stats/network-uptime", async (params) => {
-      const epochCount = parseInt(params.get("epochs") || "30");
-      return this.db.getNetworkUptimeByEpoch(epochCount);
-    });
-
-    // ──────────────────────────────────────────────────────────
-    // GET /stats/timeline
-    // Network metrics time-series for dashboard charts
-    // Query params:
-    //   ?hours=24    (how far back, default 24)
-    //   ?limit=200   (max data points, default 200)
-    // ──────────────────────────────────────────────────────────
-    this.routes.set("GET /stats/timeline", async (params) => {
-      const hours = parseInt(params.get("hours") || "24");
-      const limit = parseInt(params.get("limit") || "200");
-      return this.db.getMetricsTimeline(hours, limit);
-    });
-
-    // ──────────────────────────────────────────────────────────
-    // GET /stats/throughput
-    // Event throughput breakdown by hour and category
-    // Query params:
-    //   ?hours=24    (how far back, default 24)
-    // ──────────────────────────────────────────────────────────
-    this.routes.set("GET /stats/throughput", async (params) => {
-      const hours = parseInt(params.get("hours") || "24");
-      return this.db.getThroughputStats(hours);
-    });
-
-    // ──────────────────────────────────────────────────────────
-    // GET /stats/latency
-    // Live RPC latency metrics from the indexer
-    // ──────────────────────────────────────────────────────────
-    this.routes.set("GET /stats/latency", async () => {
-      if (!this.indexer) {
-        return { error: "Indexer not connected" };
-      }
-      return this.indexer.getLatencyStats();
-    });
-
-    // ──────────────────────────────────────────────────────────
-    // GET /epochs/durations
-    // Epoch duration analysis with per-epoch prime/slash counts
-    // Query params:
-    //   ?limit=50    (default 50)
-    // ──────────────────────────────────────────────────────────
-    this.routes.set("GET /epochs/durations", async (params) => {
-      const limit = parseInt(params.get("limit") || "50");
-      return this.db.getEpochDurations(limit);
     });
   }
 
@@ -344,14 +388,19 @@ export class Api {
           availableEndpoints: [
             "GET /health",
             "GET /stats",
+            "GET /stats/summary",
             "GET /stats/network-uptime",
             "GET /stats/timeline",
-            "GET /stats/throughput",
-            "GET /stats/latency",
+            "GET /stats/event-activity",
+            "GET /stats/rpc-latency",
             "GET /validators",
+            "GET /validators/top",
             "GET /validators/:address",
             "GET /validators/:address/history",
             "GET /validators/:address/uptime",
+            "GET /validators/:address/participation-history",
+            "GET /validators/:address/reward-history",
+            "GET /validators/:address/slash-history",
             "GET /validators/:address/delegations",
             "GET /validators/:address/transactions",
             "GET /consensus/stats",
@@ -359,6 +408,7 @@ export class Api {
             "GET /epochs/:epoch",
             "GET /epochs/durations",
             "GET /events",
+            "GET /events/feed",
             "GET /events/slashes",
             "GET /delegations",
           ],
@@ -386,41 +436,24 @@ export class Api {
       return this.routes.get(exactKey)!;
     }
 
-    // Parameterized matches
-    // /validators/:address/history
-    if (
-      pathParts.length === 3 &&
-      pathParts[0] === "validators" &&
-      pathParts[2] === "history"
-    ) {
-      return this.routes.get("GET /validators/:address/history")!;
+    // /validators/top (must check before :address)
+    if (pathParts.length === 2 && pathParts[0] === "validators" && pathParts[1] === "top") {
+      return this.routes.get("GET /validators/top")!;
     }
 
-    // /validators/:address/uptime
-    if (
-      pathParts.length === 3 &&
-      pathParts[0] === "validators" &&
-      pathParts[2] === "uptime"
-    ) {
-      return this.routes.get("GET /validators/:address/uptime")!;
-    }
-
-    // /validators/:address/delegations
-    if (
-      pathParts.length === 3 &&
-      pathParts[0] === "validators" &&
-      pathParts[2] === "delegations"
-    ) {
-      return this.routes.get("GET /validators/:address/delegations")!;
-    }
-
-    // /validators/:address/transactions
-    if (
-      pathParts.length === 3 &&
-      pathParts[0] === "validators" &&
-      pathParts[2] === "transactions"
-    ) {
-      return this.routes.get("GET /validators/:address/transactions")!;
+    // /validators/:address/sub-routes
+    if (pathParts.length === 3 && pathParts[0] === "validators") {
+      const subRoutes: Record<string, string> = {
+        history: "GET /validators/:address/history",
+        uptime: "GET /validators/:address/uptime",
+        delegations: "GET /validators/:address/delegations",
+        transactions: "GET /validators/:address/transactions",
+        "participation-history": "GET /validators/:address/participation-history",
+        "reward-history": "GET /validators/:address/reward-history",
+        "slash-history": "GET /validators/:address/slash-history",
+      };
+      const route = subRoutes[pathParts[2]];
+      if (route) return this.routes.get(route)!;
     }
 
     // /consensus/stats
@@ -433,14 +466,20 @@ export class Api {
       return this.routes.get("GET /validators/:address")!;
     }
 
-    // /epochs/durations (must check before :epoch to avoid matching "durations" as epoch number)
+    // /epochs/durations (must check before :epoch)
     if (pathParts.length === 2 && pathParts[0] === "epochs" && pathParts[1] === "durations") {
       return this.routes.get("GET /epochs/durations")!;
     }
 
-    // /stats/timeline, /stats/throughput, /stats/latency
+    // /stats/* sub-routes (summary, network-uptime, timeline, event-activity, rpc-latency, throughput, latency)
     if (pathParts.length === 2 && pathParts[0] === "stats") {
       const subRoute = `GET /stats/${pathParts[1]}`;
+      if (this.routes.has(subRoute)) return this.routes.get(subRoute)!;
+    }
+
+    // /events/feed, /events/slashes
+    if (pathParts.length === 2 && pathParts[0] === "events") {
+      const subRoute = `GET /events/${pathParts[1]}`;
       if (this.routes.has(subRoute)) return this.routes.get(subRoute)!;
     }
 

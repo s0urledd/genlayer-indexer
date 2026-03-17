@@ -786,4 +786,516 @@ export class Database {
     );
     return result.rows;
   }
+
+  // ============================================================
+  // Dashboard Summary (single-call aggregate for top bar)
+  // ============================================================
+
+  async getDashboardSummary(rpcLatency?: { avgMs: number; p95Ms: number }) {
+    const result = await this.pool.query(`
+      SELECT
+        (SELECT COUNT(*) FROM validators) as total_validators,
+        (SELECT COUNT(*) FROM validators WHERE status = 'active') as active_validators,
+        (SELECT COUNT(*) FROM validators WHERE status = 'banned') as banned_validators,
+        (SELECT COUNT(*) FROM validators WHERE status = 'quarantined') as quarantined_validators,
+        (SELECT MAX(epoch) FROM epochs) as latest_epoch,
+        (SELECT COALESCE(SUM(total_stake), 0) FROM validators) as total_staked,
+        (SELECT CASE WHEN SUM(prime_count + slash_count) > 0
+          THEN ROUND(SUM(prime_count)::numeric / SUM(prime_count + slash_count) * 100, 2)
+          ELSE 100
+        END FROM validators WHERE status = 'active') as avg_participation,
+        (SELECT COUNT(*) FROM events WHERE block_timestamp > NOW() - INTERVAL '24 hours') as event_throughput_24h
+    `);
+    const row = result.rows[0];
+
+    // Network uptime = avg of last 30 epochs
+    const uptimeResult = await this.pool.query(`
+      SELECT COALESCE(AVG(
+        CASE WHEN COALESCE(e.validator_count,
+          (SELECT COUNT(*) FROM validators WHERE status = 'active')
+        ) > 0
+          THEN COALESCE(p.primed_count, 0)::numeric /
+            COALESCE(e.validator_count,
+              (SELECT COUNT(*) FROM validators WHERE status = 'active')
+            ) * 100
+          ELSE 0
+        END
+      ), 0) as network_uptime
+      FROM epochs e
+      LEFT JOIN (
+        SELECT (args->>'epoch')::bigint as epoch, COUNT(DISTINCT args->>'validator') as primed_count
+        FROM events WHERE event_name = 'ValidatorPrime'
+        GROUP BY (args->>'epoch')::bigint
+      ) p ON p.epoch = e.epoch
+      WHERE e.epoch >= COALESCE((SELECT MAX(epoch) - 29 FROM epochs), 0)
+    `);
+
+    return {
+      active_validators: parseInt(row.active_validators),
+      banned_validators: parseInt(row.banned_validators),
+      quarantined_validators: parseInt(row.quarantined_validators),
+      total_validators: parseInt(row.total_validators),
+      latest_epoch: row.latest_epoch,
+      total_staked: row.total_staked,
+      avg_participation: parseFloat(row.avg_participation),
+      network_uptime: parseFloat(parseFloat(uptimeResult.rows[0].network_uptime).toFixed(2)),
+      event_throughput_24h: parseInt(row.event_throughput_24h),
+      rpc_latency_avg_ms: rpcLatency?.avgMs ?? null,
+      rpc_latency_p95_ms: rpcLatency?.p95Ms ?? null,
+    };
+  }
+
+  // ============================================================
+  // Top Validators (sorted by different criteria)
+  // ============================================================
+
+  async getTopValidators(sort: "stake" | "participation" | "rewards" = "stake", limit = 10) {
+    const orderBy = {
+      stake: "v.total_stake DESC",
+      participation: "participation_score DESC, v.total_stake DESC",
+      rewards: "v.total_rewards DESC",
+    }[sort];
+
+    const result = await this.pool.query(
+      `SELECT v.address, v.status, v.total_stake, v.total_rewards, v.total_slashed,
+        v.prime_count, v.slash_count,
+        COALESCE(d.delegated_stake, 0) as delegated_stake,
+        COALESCE(d.delegator_count, 0) as delegator_count,
+        v.total_stake - COALESCE(d.delegated_stake, 0) as self_stake,
+        CASE WHEN v.prime_count + v.slash_count > 0
+          THEN ROUND(v.prime_count::numeric / (v.prime_count + v.slash_count) * 100, 2)
+          ELSE 100
+        END as participation_score
+       FROM validators v
+       LEFT JOIN (
+         SELECT validator_address,
+           SUM(total_deposited - total_withdrawn) as delegated_stake,
+           COUNT(*) FILTER (WHERE total_deposited > total_withdrawn) as delegator_count
+         FROM delegations GROUP BY validator_address
+       ) d ON d.validator_address = v.address
+       ORDER BY ${orderBy}
+       LIMIT $1`,
+      [limit]
+    );
+    return result.rows;
+  }
+
+  // ============================================================
+  // Participation History (chart-friendly per-epoch data)
+  // ============================================================
+
+  async getValidatorParticipationHistory(address: string, epochCount = 30) {
+    const result = await this.pool.query(
+      `SELECT
+         e.epoch,
+         CASE WHEN prime_ev.id IS NOT NULL THEN true ELSE false END as prime_present,
+         CASE WHEN slash_ev.cnt > 0 THEN true ELSE false END as slashed,
+         v.status
+       FROM epochs e
+       CROSS JOIN (SELECT status FROM validators WHERE address = $1) v
+       LEFT JOIN events prime_ev ON prime_ev.event_name = 'ValidatorPrime'
+         AND prime_ev.args->>'validator' = $1
+         AND (prime_ev.args->>'epoch')::bigint = e.epoch
+       LEFT JOIN (
+         SELECT (args->>'epoch')::bigint as epoch, COUNT(*) as cnt
+         FROM events
+         WHERE category = 'slashing' AND args->>'validator' = $1
+         GROUP BY (args->>'epoch')::bigint
+       ) slash_ev ON slash_ev.epoch = e.epoch
+       ORDER BY e.epoch DESC
+       LIMIT $2`,
+      [address.toLowerCase(), epochCount]
+    );
+
+    // Compute running participation_score
+    const rows = result.rows;
+    let primeTotal = 0;
+    let totalDuties = 0;
+    // Process in epoch-ascending order for running score
+    const reversed = [...rows].reverse();
+    const scored = reversed.map((r) => {
+      totalDuties++;
+      if (r.prime_present) primeTotal++;
+      return {
+        epoch: r.epoch,
+        participation_score: totalDuties > 0 ? parseFloat(((primeTotal / totalDuties) * 100).toFixed(2)) : 100,
+        prime_present: r.prime_present,
+        slashed: r.slashed,
+        status: r.status,
+      };
+    });
+    return scored.reverse(); // Return most-recent-first
+  }
+
+  // ============================================================
+  // Reward History (chart-friendly per-epoch rewards)
+  // ============================================================
+
+  async getValidatorRewardHistory(address: string, limit = 50) {
+    const result = await this.pool.query(
+      `SELECT
+         (args->>'epoch')::bigint as epoch,
+         block_timestamp as timestamp,
+         COALESCE((args->>'validatorRewards')::numeric, 0) as validator_rewards,
+         COALESCE((args->>'delegatorRewards')::numeric, 0) as delegator_rewards,
+         COALESCE((args->>'feeRewards')::numeric, 0) as fee_rewards,
+         COALESCE((args->>'feePenalties')::numeric, 0) as fee_penalties,
+         COALESCE((args->>'validatorRewards')::numeric, 0)
+           + COALESCE((args->>'feeRewards')::numeric, 0)
+           - COALESCE((args->>'feePenalties')::numeric, 0) as net_rewards
+       FROM events
+       WHERE event_name = 'ValidatorPrime'
+         AND args->>'validator' = $1
+       ORDER BY block_number DESC
+       LIMIT $2`,
+      [address.toLowerCase(), limit]
+    );
+    return result.rows;
+  }
+
+  // ============================================================
+  // Slash History (timeline of slashes/quarantines/bans)
+  // ============================================================
+
+  async getValidatorSlashHistory(address: string, limit = 50) {
+    const result = await this.pool.query(
+      `SELECT
+         e.block_timestamp as timestamp,
+         COALESCE((e.args->>'epoch')::bigint,
+           (SELECT MAX(epoch) FROM epochs WHERE advanced_at_block <= e.block_number)
+         ) as epoch,
+         e.event_name as slash_type,
+         COALESCE((e.args->>'amount')::numeric, (e.args->>'slashAmount')::numeric, 0) as amount,
+         CASE
+           WHEN e.event_name = 'SlashedFromIdleness' THEN 'Idleness'
+           WHEN e.event_name = 'ValidatorBannedIdleness' THEN 'Banned for idleness'
+           WHEN e.event_name = 'ValidatorBannedDeterministic' THEN 'Banned for deterministic violation'
+           WHEN e.event_name = 'ValidatorSlash' THEN 'Slashed'
+           WHEN e.event_name = 'ValidatorQuarantined' THEN 'Quarantined'
+           ELSE e.event_name
+         END as reason,
+         CASE
+           WHEN e.event_name IN ('ValidatorBannedIdleness', 'ValidatorBannedDeterministic') THEN 'banned'
+           WHEN e.event_name = 'ValidatorQuarantined' THEN 'quarantined'
+           ELSE 'active'
+         END as resulting_status
+       FROM events e
+       WHERE e.args->>'validator' = $1
+         AND (e.category = 'slashing' OR e.category = 'quarantine')
+       ORDER BY e.block_number DESC
+       LIMIT $2`,
+      [address.toLowerCase(), limit]
+    );
+    return result.rows;
+  }
+
+  // ============================================================
+  // Event Feed (normalized, UI-ready event stream)
+  // ============================================================
+
+  async getEventFeed(limit = 50, offset = 0) {
+    const result = await this.pool.query(
+      `SELECT
+         id,
+         block_timestamp as timestamp,
+         event_name,
+         category,
+         args,
+         block_number
+       FROM events
+       ORDER BY block_number DESC, log_index DESC
+       LIMIT $1 OFFSET $2`,
+      [limit, offset]
+    );
+
+    return result.rows.map((row) => {
+      const { type, title, subtitle, severity } = this.mapEventToFeed(row.event_name, row.args, row.category);
+      return {
+        id: row.id,
+        timestamp: row.timestamp,
+        type,
+        title,
+        subtitle,
+        validator_address: row.args?.validator || null,
+        tx_id: row.args?.txId || row.args?.hash || null,
+        severity,
+      };
+    });
+  }
+
+  private mapEventToFeed(eventName: string, args: Record<string, unknown>, category: string): {
+    type: string;
+    title: string;
+    subtitle: string;
+    severity: "info" | "warning" | "critical";
+  } {
+    const addr = (args?.validator as string)?.slice(0, 10) || "";
+
+    switch (eventName) {
+      case "EpochFinalize":
+        return { type: "epoch_finalized", title: "Epoch Finalized", subtitle: `Epoch ${args?.epoch || ""}`, severity: "info" };
+      case "EpochAdvance":
+        return { type: "epoch_advanced", title: "Epoch Advanced", subtitle: `Epoch ${args?.epoch || ""}`, severity: "info" };
+      case "ValidatorPrime":
+        return { type: "validator_primed", title: "Validator Primed", subtitle: `${addr}... epoch ${args?.epoch || ""}`, severity: "info" };
+      case "ValidatorSlash":
+        return { type: "validator_slashed", title: "Validator Slashed", subtitle: `${addr}...`, severity: "warning" };
+      case "SlashedFromIdleness":
+        return { type: "validator_slashed", title: "Slashed (Idleness)", subtitle: `${addr}...`, severity: "warning" };
+      case "ValidatorQuarantined":
+        return { type: "validator_quarantined", title: "Validator Quarantined", subtitle: `${addr}...`, severity: "warning" };
+      case "ValidatorBannedIdleness":
+      case "ValidatorBannedDeterministic":
+        return { type: "validator_banned", title: "Validator Banned", subtitle: `${addr}...`, severity: "critical" };
+      case "ValidatorJoin":
+        return { type: "validator_joined", title: "Validator Joined", subtitle: `${addr}...`, severity: "info" };
+      case "ValidatorExit":
+        return { type: "validator_exited", title: "Validator Exited", subtitle: `${addr}...`, severity: "info" };
+      case "DelegatorJoin":
+        return { type: "delegation_updated", title: "Delegation Added", subtitle: `to ${addr}...`, severity: "info" };
+      case "DelegatorExit":
+        return { type: "delegation_updated", title: "Delegation Removed", subtitle: `from ${addr}...`, severity: "info" };
+      case "TransactionFinalized":
+        return { type: "tx_finalized", title: "Transaction Finalized", subtitle: `${(args?.txId as string)?.slice(0, 10) || ""}...`, severity: "info" };
+      case "TransactionAccepted":
+        return { type: "tx_accepted", title: "Transaction Accepted", subtitle: `${(args?.txId as string)?.slice(0, 10) || ""}...`, severity: "info" };
+      case "TransactionLeaderRotated":
+        return { type: "leader_rotated", title: "Leader Rotated", subtitle: `${(args?.txId as string)?.slice(0, 10) || ""}...`, severity: "warning" };
+      case "AppealStarted":
+        return { type: "appeal_started", title: "Appeal Started", subtitle: `${(args?.txId as string)?.slice(0, 10) || ""}...`, severity: "warning" };
+      default:
+        return {
+          type: category,
+          title: eventName.replace(/([A-Z])/g, " $1").trim(),
+          subtitle: addr ? `${addr}...` : "",
+          severity: category === "slashing" ? "warning" : "info",
+        };
+    }
+  }
+
+  // ============================================================
+  // Consensus Tx for Validator (with detail mode)
+  // ============================================================
+
+  async getConsensusTxForValidatorCompact(validator: string, limit = 50, offset = 0) {
+    const result = await this.pool.query(
+      `SELECT ct.tx_id, ct.status, ct.created_at_timestamp as submitted_at,
+         vtp.role, ct.rotation_count, ct.appeal_count
+       FROM consensus_transactions ct
+       INNER JOIN validator_tx_participation vtp ON vtp.tx_id = ct.tx_id
+       WHERE vtp.validator = $1
+       ORDER BY ct.created_at_block DESC NULLS LAST
+       LIMIT $2 OFFSET $3`,
+      [validator.toLowerCase(), limit, offset]
+    );
+    return result.rows;
+  }
+
+  // ============================================================
+  // Enhanced Validator Detail
+  // ============================================================
+
+  async getValidatorEnriched(address: string) {
+    const addr = address.toLowerCase();
+    const result = await this.pool.query(
+      `SELECT v.*,
+        COALESCE(d.delegated_stake, 0) as delegated_stake,
+        COALESCE(d.delegator_count, 0) as delegator_count,
+        v.total_stake - COALESCE(d.delegated_stake, 0) as self_stake,
+        CASE WHEN v.prime_count + v.slash_count > 0
+          THEN ROUND(v.prime_count::numeric / (v.prime_count + v.slash_count) * 100, 2)
+          ELSE 100
+        END as participation_score,
+        COALESCE(u.uptime_pct, 100) as uptime_percentage,
+        -- latest status-changing event timestamp
+        (SELECT block_timestamp FROM events
+         WHERE args->>'validator' = $1
+           AND event_name IN ('ValidatorJoin','ValidatorExit','ValidatorBannedIdleness','ValidatorBannedDeterministic','ValidatorQuarantined','ValidatorQuarantineRemoved','ValidatorBanRemoved','AllValidatorBansRemoved')
+         ORDER BY block_number DESC LIMIT 1
+        ) as latest_status_change_at,
+        -- last event timestamp
+        (SELECT block_timestamp FROM events
+         WHERE args->>'validator' = $1
+         ORDER BY block_number DESC LIMIT 1
+        ) as last_event_at,
+        -- recent slashes in last 30 days
+        (SELECT COUNT(*) FROM events
+         WHERE args->>'validator' = $1
+           AND category = 'slashing'
+           AND block_timestamp > NOW() - INTERVAL '30 days'
+        ) as recent_slash_count_30d,
+        -- recent prime rate over last 30 epochs
+        (SELECT CASE WHEN COUNT(*) > 0
+          THEN ROUND(
+            COUNT(*) FILTER (WHERE prime_ev.id IS NOT NULL)::numeric / COUNT(*) * 100, 2
+          ) ELSE 100 END
+         FROM (SELECT epoch FROM epochs ORDER BY epoch DESC LIMIT 30) recent_e
+         LEFT JOIN events prime_ev ON prime_ev.event_name = 'ValidatorPrime'
+           AND prime_ev.args->>'validator' = $1
+           AND (prime_ev.args->>'epoch')::bigint = recent_e.epoch
+        ) as recent_prime_rate_30_epochs
+       FROM validators v
+       LEFT JOIN (
+         SELECT validator_address,
+           SUM(total_deposited - total_withdrawn) as delegated_stake,
+           COUNT(*) FILTER (WHERE total_deposited > total_withdrawn) as delegator_count
+         FROM delegations GROUP BY validator_address
+       ) d ON d.validator_address = v.address
+       LEFT JOIN (
+         SELECT args->>'validator' as validator,
+           ROUND(COUNT(*)::numeric / GREATEST(
+             (SELECT COUNT(*) FROM epochs ORDER BY epoch DESC LIMIT 30), 1
+           ) * 100, 2) as uptime_pct
+         FROM events
+         WHERE event_name = 'ValidatorPrime'
+           AND (args->>'epoch')::bigint >= COALESCE((SELECT MAX(epoch) - 29 FROM epochs), 0)
+         GROUP BY args->>'validator'
+       ) u ON u.validator = v.address
+       WHERE v.address = $1`,
+      [addr]
+    );
+
+    if (!result.rows[0]) return null;
+
+    const row = result.rows[0];
+    // Also compute recent_participation_score_30_epochs from participation history
+    // (prime_count over last 30 epochs vs slash count)
+    return {
+      ...row,
+      latest_primed_epoch: row.last_prime_epoch,
+      recent_participation_score_30_epochs: parseFloat(row.recent_prime_rate_30_epochs),
+    };
+  }
+
+  // ============================================================
+  // Validators with sort/order support
+  // ============================================================
+
+  private static readonly VALIDATOR_SORT_WHITELIST = new Set([
+    "total_stake", "participation_score", "total_rewards", "total_slashed",
+    "prime_count", "slash_count", "delegated_stake", "uptime_percentage",
+  ]);
+
+  async getValidatorsSorted(params: {
+    status?: string;
+    limit?: number;
+    offset?: number;
+    sort?: string;
+    order?: "asc" | "desc";
+  }) {
+    const conditions: string[] = [];
+    const values: unknown[] = [];
+    let paramIndex = 1;
+
+    if (params.status) {
+      conditions.push(`v.status = $${paramIndex++}`);
+      values.push(params.status);
+    }
+
+    const where = conditions.length > 0 ? `WHERE ${conditions.join(" AND ")}` : "";
+    const limit = params.limit || 100;
+    const offset = params.offset || 0;
+
+    // Validate sort field
+    const sortField = params.sort && Database.VALIDATOR_SORT_WHITELIST.has(params.sort)
+      ? params.sort : "total_stake";
+    const sortOrder = params.order === "asc" ? "ASC" : "DESC";
+
+    const result = await this.pool.query(
+      `SELECT v.*,
+        COALESCE(d.delegated_stake, 0) as delegated_stake,
+        COALESCE(d.delegator_count, 0) as delegator_count,
+        v.total_stake - COALESCE(d.delegated_stake, 0) as self_stake,
+        CASE WHEN v.prime_count + v.slash_count > 0
+          THEN ROUND(v.prime_count::numeric / (v.prime_count + v.slash_count) * 100, 2)
+          ELSE 100
+        END as participation_score,
+        COALESCE(u.uptime_pct, 100) as uptime_percentage
+       FROM validators v
+       LEFT JOIN (
+         SELECT validator_address,
+           SUM(total_deposited - total_withdrawn) as delegated_stake,
+           COUNT(*) FILTER (WHERE total_deposited > total_withdrawn) as delegator_count
+         FROM delegations GROUP BY validator_address
+       ) d ON d.validator_address = v.address
+       LEFT JOIN (
+         SELECT args->>'validator' as validator,
+           ROUND(COUNT(*)::numeric / GREATEST(
+             (SELECT COUNT(*) FROM epochs ORDER BY epoch DESC LIMIT 30), 1
+           ) * 100, 2) as uptime_pct
+         FROM events
+         WHERE event_name = 'ValidatorPrime'
+           AND (args->>'epoch')::bigint >= COALESCE((SELECT MAX(epoch) - 29 FROM epochs), 0)
+         GROUP BY args->>'validator'
+       ) u ON u.validator = v.address
+       ${where}
+       ORDER BY ${sortField} ${sortOrder}
+       LIMIT $${paramIndex++} OFFSET $${paramIndex++}`,
+      [...values, limit, offset]
+    );
+    return result.rows;
+  }
+
+  // ============================================================
+  // Events with sort/order support
+  // ============================================================
+
+  private static readonly EVENT_SORT_WHITELIST = new Set([
+    "block_number", "block_timestamp", "event_name", "category",
+  ]);
+
+  async getEventsSorted(params: {
+    eventName?: string;
+    category?: string;
+    validator?: string;
+    fromBlock?: bigint;
+    toBlock?: bigint;
+    limit?: number;
+    offset?: number;
+    sort?: string;
+    order?: "asc" | "desc";
+  }) {
+    const conditions: string[] = [];
+    const values: unknown[] = [];
+    let paramIndex = 1;
+
+    if (params.eventName) {
+      conditions.push(`event_name = $${paramIndex++}`);
+      values.push(params.eventName);
+    }
+    if (params.category) {
+      conditions.push(`category = $${paramIndex++}`);
+      values.push(params.category);
+    }
+    if (params.validator) {
+      conditions.push(`args->>'validator' = $${paramIndex++}`);
+      values.push(params.validator.toLowerCase());
+    }
+    if (params.fromBlock !== undefined) {
+      conditions.push(`block_number >= $${paramIndex++}`);
+      values.push(params.fromBlock.toString());
+    }
+    if (params.toBlock !== undefined) {
+      conditions.push(`block_number <= $${paramIndex++}`);
+      values.push(params.toBlock.toString());
+    }
+
+    const where = conditions.length > 0 ? `WHERE ${conditions.join(" AND ")}` : "";
+    const limit = params.limit || 100;
+    const offset = params.offset || 0;
+
+    const sortField = params.sort && Database.EVENT_SORT_WHITELIST.has(params.sort)
+      ? params.sort : "block_number";
+    const sortOrder = params.order === "asc" ? "ASC" : "DESC";
+    const secondary = sortField === "block_number" ? ", log_index DESC" : "";
+
+    const result = await this.pool.query(
+      `SELECT id, block_number, tx_hash, log_index, contract_address, event_name, category, args, block_timestamp, created_at
+       FROM events ${where}
+       ORDER BY ${sortField} ${sortOrder}${secondary}
+       LIMIT $${paramIndex++} OFFSET $${paramIndex++}`,
+      [...values, limit, offset]
+    );
+    return result.rows;
+  }
 }

@@ -27,8 +27,9 @@ export class Indexer {
   private blockTimestampCache = new Map<bigint, Date>();
   private readonly TIMESTAMP_CACHE_MAX = 5000;
 
-  // RPC latency tracking
-  private rpcLatencySamples: number[] = [];
+  // RPC latency tracking (ping = getBlockNumber, fetch = getLogs)
+  private rpcPingSamples: number[] = [];
+  private rpcFetchSamples: number[] = [];
   private readonly LATENCY_WINDOW = 100; // keep last 100 samples
 
   // Metrics snapshot interval (every 60 batches ≈ 5 minutes at 5s poll)
@@ -70,7 +71,7 @@ export class Indexer {
   }
 
   private async indexBatch() {
-    const currentBlock = await this.measureRpc(() => this.client.getBlockNumber());
+    const currentBlock = await this.measureRpc("ping", () => this.client.getBlockNumber());
 
     // Index both contracts in parallel for ~2x faster catch-up
     await Promise.all([
@@ -90,11 +91,11 @@ export class Indexer {
     this.batchCount++;
     if (this.batchCount % this.METRICS_INTERVAL === 0) {
       try {
-        const latency = this.getLatencyStats();
+        const { rpcPing } = this.getLatencyStats();
         await this.db.recordMetricsSnapshot({
           blockNumber: currentBlock,
-          rpcLatencyAvg: latency.avgMs,
-          rpcLatencyP95: latency.p95Ms,
+          rpcLatencyAvg: rpcPing.avgMs,
+          rpcLatencyP95: rpcPing.p95Ms,
         });
       } catch (err) {
         console.error("Failed to record metrics snapshot:", err);
@@ -136,7 +137,7 @@ export class Indexer {
     }
 
     // Fetch all logs from this contract in the block range
-    const logs = await this.measureRpc(() =>
+    const logs = await this.measureRpc("fetch", () =>
       this.client.getLogs({
         address: contractAddress,
         fromBlock,
@@ -656,31 +657,24 @@ export class Indexer {
     }
   }
 
-  // Measure and record RPC latency for a given async call
-  private async measureRpc<T>(fn: () => Promise<T>): Promise<T> {
+  // Measure and record RPC call duration
+  private async measureRpc<T>(type: "ping" | "fetch", fn: () => Promise<T>): Promise<T> {
     const start = performance.now();
     const result = await fn();
-    const latency = performance.now() - start;
-    this.rpcLatencySamples.push(latency);
-    if (this.rpcLatencySamples.length > this.LATENCY_WINDOW) {
-      this.rpcLatencySamples.shift();
+    const duration = performance.now() - start;
+    const samples = type === "ping" ? this.rpcPingSamples : this.rpcFetchSamples;
+    samples.push(duration);
+    if (samples.length > this.LATENCY_WINDOW) {
+      samples.shift();
     }
     return result;
   }
 
-  // Expose latency stats for the API
-  getLatencyStats(): {
-    avgMs: number;
-    minMs: number;
-    maxMs: number;
-    p50Ms: number;
-    p95Ms: number;
-    samples: number;
-  } {
-    if (this.rpcLatencySamples.length === 0) {
+  private computeStats(samples: number[]) {
+    if (samples.length === 0) {
       return { avgMs: 0, minMs: 0, maxMs: 0, p50Ms: 0, p95Ms: 0, samples: 0 };
     }
-    const sorted = [...this.rpcLatencySamples].sort((a, b) => a - b);
+    const sorted = [...samples].sort((a, b) => a - b);
     const sum = sorted.reduce((a, b) => a + b, 0);
     const p = (pct: number) => sorted[Math.floor(sorted.length * pct)] || 0;
     return {
@@ -690,6 +684,14 @@ export class Indexer {
       p50Ms: Math.round(p(0.5)),
       p95Ms: Math.round(p(0.95)),
       samples: sorted.length,
+    };
+  }
+
+  // Expose latency stats for the API
+  getLatencyStats() {
+    return {
+      rpcPing: this.computeStats(this.rpcPingSamples),
+      logFetch: this.computeStats(this.rpcFetchSamples),
     };
   }
 
