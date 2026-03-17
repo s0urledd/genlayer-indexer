@@ -1,7 +1,6 @@
 import {
   createPublicClient,
   http,
-  parseAbiItem,
   type Log,
   type AbiEvent,
   decodeEventLog,
@@ -24,6 +23,17 @@ export class Indexer {
   private client;
   private db: Database;
   private running = false;
+  // Block timestamp cache - avoids N+1 RPC calls per batch
+  private blockTimestampCache = new Map<bigint, Date>();
+  private readonly TIMESTAMP_CACHE_MAX = 5000;
+
+  // RPC latency tracking
+  private rpcLatencySamples: number[] = [];
+  private readonly LATENCY_WINDOW = 100; // keep last 100 samples
+
+  // Metrics snapshot interval (every 60 batches ≈ 5 minutes at 5s poll)
+  private batchCount = 0;
+  private readonly METRICS_INTERVAL = 60;
 
   constructor(db: Database) {
     this.client = createPublicClient({
@@ -60,23 +70,46 @@ export class Indexer {
   }
 
   private async indexBatch() {
-    const currentBlock = await this.client.getBlockNumber();
+    const currentBlock = await this.measureRpc(() => this.client.getBlockNumber());
 
-    // Index staking contract
-    await this.indexContract(
-      config.stakingContract,
-      STAKING_EVENTS_ABI as unknown as AbiEvent[],
-      currentBlock
-    );
+    // Index both contracts in parallel for ~2x faster catch-up
+    await Promise.all([
+      this.indexContract(
+        config.stakingContract,
+        STAKING_EVENTS_ABI as unknown as AbiEvent[],
+        currentBlock
+      ),
+      this.indexContract(
+        config.consensusContract,
+        SLASHING_EVENTS_ABI as unknown as AbiEvent[],
+        currentBlock
+      ),
+    ]);
 
-    // Index slashing events from consensus contract
-    // (SlashedFromIdleness comes from a separate slashing contract,
-    //  but we check consensus address as well)
-    await this.indexContract(
-      config.consensusContract,
-      SLASHING_EVENTS_ABI as unknown as AbiEvent[],
-      currentBlock
-    );
+    // Record metrics snapshot periodically
+    this.batchCount++;
+    if (this.batchCount % this.METRICS_INTERVAL === 0) {
+      try {
+        const latency = this.getLatencyStats();
+        await this.db.recordMetricsSnapshot({
+          blockNumber: currentBlock,
+          rpcLatencyAvg: latency.avgMs,
+          rpcLatencyP95: latency.p95Ms,
+        });
+      } catch (err) {
+        console.error("Failed to record metrics snapshot:", err);
+      }
+    }
+
+    // Evict old cache entries to prevent memory bloat
+    if (this.blockTimestampCache.size > this.TIMESTAMP_CACHE_MAX) {
+      const entries = [...this.blockTimestampCache.entries()]
+        .sort((a, b) => Number(a[0] - b[0]));
+      const toRemove = entries.slice(0, entries.length - this.TIMESTAMP_CACHE_MAX / 2);
+      for (const [key] of toRemove) {
+        this.blockTimestampCache.delete(key);
+      }
+    }
   }
 
   private async indexContract(
@@ -103,11 +136,13 @@ export class Indexer {
     }
 
     // Fetch all logs from this contract in the block range
-    const logs = await this.client.getLogs({
-      address: contractAddress,
-      fromBlock,
-      toBlock,
-    });
+    const logs = await this.measureRpc(() =>
+      this.client.getLogs({
+        address: contractAddress,
+        fromBlock,
+        toBlock,
+      })
+    );
 
     if (logs.length > 0) {
       console.log(
@@ -144,8 +179,37 @@ export class Indexer {
       blockTimestamp?: Date;
     }> = [];
 
-    // Build combined ABI for decoding
     const combinedAbi = [...eventAbis];
+
+    // Batch-fetch block timestamps: collect unique block numbers first,
+    // then fetch only the ones not already in cache (fixes N+1 RPC problem)
+    const uniqueBlocks = new Set<bigint>();
+    for (const log of logs) {
+      if (log.blockNumber && !this.blockTimestampCache.has(log.blockNumber)) {
+        uniqueBlocks.add(log.blockNumber);
+      }
+    }
+
+    if (uniqueBlocks.size > 0) {
+      // Fetch blocks in parallel batches of 20 to avoid overwhelming RPC
+      const blockNumbers = [...uniqueBlocks];
+      const PARALLEL_LIMIT = 20;
+      for (let i = 0; i < blockNumbers.length; i += PARALLEL_LIMIT) {
+        const batch = blockNumbers.slice(i, i + PARALLEL_LIMIT);
+        const results = await Promise.allSettled(
+          batch.map((bn) => this.client.getBlock({ blockNumber: bn }))
+        );
+        for (let j = 0; j < results.length; j++) {
+          const result = results[j];
+          if (result.status === "fulfilled") {
+            this.blockTimestampCache.set(
+              batch[j],
+              new Date(Number(result.value.timestamp) * 1000)
+            );
+          }
+        }
+      }
+    }
 
     for (const log of logs) {
       if (!log.blockNumber || !log.transactionHash) continue;
@@ -167,17 +231,6 @@ export class Indexer {
           }
         }
 
-        // Try to get block timestamp
-        let blockTimestamp: Date | undefined;
-        try {
-          const block = await this.client.getBlock({
-            blockNumber: log.blockNumber,
-          });
-          blockTimestamp = new Date(Number(block.timestamp) * 1000);
-        } catch {
-          // Timestamp is optional, continue without it
-        }
-
         decoded.push({
           blockNumber: log.blockNumber,
           txHash: log.transactionHash,
@@ -185,7 +238,7 @@ export class Indexer {
           contractAddress: contractAddress.toLowerCase(),
           eventName: result.eventName,
           args,
-          blockTimestamp,
+          blockTimestamp: this.blockTimestampCache.get(log.blockNumber),
         });
       } catch {
         // Log doesn't match any of our event ABIs - skip
@@ -236,7 +289,9 @@ export class Indexer {
 
       case "ValidatorDeposit": {
         const validator = (args.validator as string).toLowerCase();
-        // We'd need to add to existing stake; for now just update last seen
+        const amount = args.amount as string;
+        // Add deposit amount to existing stake
+        await this.db.incrementValidatorStake(validator, amount);
         await this.db.upsertValidator(validator, {
           lastSeenBlock: blockNumber,
         });
@@ -247,6 +302,14 @@ export class Indexer {
         const validator = (args.validator as string).toLowerCase();
         await this.db.upsertValidator(validator, {
           status: "exiting",
+          lastSeenBlock: blockNumber,
+        });
+        break;
+      }
+
+      case "ValidatorClaim": {
+        const validator = (args.validator as string).toLowerCase();
+        await this.db.upsertValidator(validator, {
           lastSeenBlock: blockNumber,
         });
         break;
@@ -299,6 +362,12 @@ export class Indexer {
           status: "banned",
           lastSeenBlock: blockNumber,
         });
+        break;
+      }
+
+      case "AllValidatorBansRemoved": {
+        // Reset ALL banned validators back to active
+        await this.db.resetAllBannedValidators();
         break;
       }
 
@@ -373,16 +442,68 @@ export class Indexer {
 
       case "SlashedFromIdleness": {
         const validator = (args.validator as string).toLowerCase();
+        const percentage = args.percentage as string;
         const current = await this.db.getValidator(validator);
         const newSlashCount = (current?.slash_count || 0) + 1;
 
+        // Calculate slashed amount from percentage and current stake
+        let slashAmount = "0";
+        if (current?.total_stake && percentage) {
+          const stake = BigInt(current.total_stake);
+          const pct = BigInt(percentage);
+          // percentage is in basis points or direct - divide by 100
+          slashAmount = ((stake * pct) / 100n).toString();
+        }
+
+        const newTotalSlashed = (
+          BigInt(current?.total_slashed || "0") + BigInt(slashAmount)
+        ).toString();
+
         await this.db.upsertValidator(validator, {
           slashCount: newSlashCount,
+          totalSlashed: newTotalSlashed,
           lastSeenBlock: blockNumber,
         });
         break;
       }
     }
+  }
+
+  // Measure and record RPC latency for a given async call
+  private async measureRpc<T>(fn: () => Promise<T>): Promise<T> {
+    const start = performance.now();
+    const result = await fn();
+    const latency = performance.now() - start;
+    this.rpcLatencySamples.push(latency);
+    if (this.rpcLatencySamples.length > this.LATENCY_WINDOW) {
+      this.rpcLatencySamples.shift();
+    }
+    return result;
+  }
+
+  // Expose latency stats for the API
+  getLatencyStats(): {
+    avgMs: number;
+    minMs: number;
+    maxMs: number;
+    p50Ms: number;
+    p95Ms: number;
+    samples: number;
+  } {
+    if (this.rpcLatencySamples.length === 0) {
+      return { avgMs: 0, minMs: 0, maxMs: 0, p50Ms: 0, p95Ms: 0, samples: 0 };
+    }
+    const sorted = [...this.rpcLatencySamples].sort((a, b) => a - b);
+    const sum = sorted.reduce((a, b) => a + b, 0);
+    const p = (pct: number) => sorted[Math.floor(sorted.length * pct)] || 0;
+    return {
+      avgMs: Math.round(sum / sorted.length),
+      minMs: Math.round(sorted[0]),
+      maxMs: Math.round(sorted[sorted.length - 1]),
+      p50Ms: Math.round(p(0.5)),
+      p95Ms: Math.round(p(0.95)),
+      samples: sorted.length,
+    };
   }
 
   private sleep(ms: number): Promise<void> {

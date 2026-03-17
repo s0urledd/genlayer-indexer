@@ -82,13 +82,22 @@ export class Database {
     const client = await this.pool.connect();
     try {
       await client.query("BEGIN");
-      for (const event of events) {
-        const category = EVENT_CATEGORIES[event.eventName] || "unknown";
-        await client.query(
-          `INSERT INTO events (block_number, tx_hash, log_index, contract_address, event_name, category, args, block_timestamp)
-           VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
-           ON CONFLICT (tx_hash, log_index) DO NOTHING`,
-          [
+
+      // Multi-row INSERT for much better performance (1 query vs N queries)
+      const CHUNK_SIZE = 500; // Avoid exceeding PG parameter limit (65535)
+      for (let i = 0; i < events.length; i += CHUNK_SIZE) {
+        const chunk = events.slice(i, i + CHUNK_SIZE);
+        const values: unknown[] = [];
+        const placeholders: string[] = [];
+
+        for (let j = 0; j < chunk.length; j++) {
+          const event = chunk[j];
+          const category = EVENT_CATEGORIES[event.eventName] || "unknown";
+          const base = j * 8;
+          placeholders.push(
+            `($${base + 1}, $${base + 2}, $${base + 3}, $${base + 4}, $${base + 5}, $${base + 6}, $${base + 7}, $${base + 8})`
+          );
+          values.push(
             event.blockNumber.toString(),
             event.txHash,
             event.logIndex,
@@ -99,9 +108,17 @@ export class Database {
               typeof value === "bigint" ? value.toString() : value
             ),
             event.blockTimestamp || null,
-          ]
+          );
+        }
+
+        await client.query(
+          `INSERT INTO events (block_number, tx_hash, log_index, contract_address, event_name, category, args, block_timestamp)
+           VALUES ${placeholders.join(", ")}
+           ON CONFLICT (tx_hash, log_index) DO NOTHING`,
+          values
         );
       }
+
       await client.query("COMMIT");
     } catch (err) {
       await client.query("ROLLBACK");
@@ -180,6 +197,25 @@ export class Database {
         data.inflationAmount || null,
         data.validatorCount ?? null,
       ]
+    );
+  }
+
+  // Atomically increment validator stake (for ValidatorDeposit)
+  async incrementValidatorStake(address: string, amount: string) {
+    await this.pool.query(
+      `UPDATE validators SET
+        total_stake = total_stake + $2,
+        updated_at = NOW()
+       WHERE address = $1`,
+      [address.toLowerCase(), amount]
+    );
+  }
+
+  // Reset all banned validators to active (for AllValidatorBansRemoved event)
+  async resetAllBannedValidators() {
+    await this.pool.query(
+      `UPDATE validators SET status = 'active', updated_at = NOW()
+       WHERE status = 'banned'`
     );
   }
 
@@ -384,12 +420,17 @@ export class Database {
         (SELECT COUNT(*) FROM validators WHERE status = 'active') as active_validators,
         (SELECT COUNT(*) FROM validators WHERE status = 'banned') as banned_validators,
         (SELECT COUNT(*) FROM validators WHERE status = 'quarantined') as quarantined_validators,
+        (SELECT COUNT(*) FROM validators WHERE status = 'exiting') as exiting_validators,
         (SELECT COALESCE(SUM(total_stake), 0) FROM validators) as total_staked,
         (SELECT COALESCE(SUM(total_rewards), 0) FROM validators) as total_rewards_distributed,
         (SELECT COALESCE(SUM(total_slashed), 0) FROM validators) as total_slashed,
         (SELECT MAX(epoch) FROM epochs) as latest_epoch,
         (SELECT COUNT(*) FROM events) as total_events,
-        (SELECT MAX(block_number) FROM events) as latest_indexed_block
+        (SELECT MAX(block_number) FROM events) as latest_indexed_block,
+        (SELECT COUNT(*) FROM events WHERE block_timestamp > NOW() - INTERVAL '1 hour') as events_last_hour,
+        (SELECT COUNT(*) FROM events WHERE block_timestamp > NOW() - INTERVAL '24 hours') as events_last_24h,
+        (SELECT COUNT(*) FROM delegations) as total_delegations,
+        (SELECT COALESCE(SUM(total_deposited - total_withdrawn), 0) FROM delegations) as total_delegated
     `);
     return result.rows[0];
   }
@@ -401,6 +442,100 @@ export class Database {
        ORDER BY block_number DESC, log_index DESC
        LIMIT $1`,
       [limit]
+    );
+    return result.rows;
+  }
+
+  // ============================================================
+  // Network Metrics (for dashboard time-series)
+  // ============================================================
+
+  async recordMetricsSnapshot(data: {
+    blockNumber: bigint;
+    rpcLatencyAvg?: number;
+    rpcLatencyP95?: number;
+  }) {
+    await this.pool.query(
+      `INSERT INTO network_metrics (
+        timestamp, block_number,
+        active_validators, banned_validators, quarantined_validators,
+        total_staked, epoch, events_in_window,
+        rpc_latency_avg_ms, rpc_latency_p95_ms
+      ) SELECT
+        NOW(), $1,
+        (SELECT COUNT(*) FROM validators WHERE status = 'active'),
+        (SELECT COUNT(*) FROM validators WHERE status = 'banned'),
+        (SELECT COUNT(*) FROM validators WHERE status = 'quarantined'),
+        (SELECT COALESCE(SUM(total_stake), 0) FROM validators),
+        (SELECT MAX(epoch) FROM epochs),
+        (SELECT COUNT(*) FROM events WHERE block_number > $1 - 1000),
+        $2, $3`,
+      [
+        data.blockNumber.toString(),
+        data.rpcLatencyAvg ?? null,
+        data.rpcLatencyP95 ?? null,
+      ]
+    );
+  }
+
+  async getMetricsTimeline(hours = 24, limit = 200) {
+    const result = await this.pool.query(
+      `SELECT * FROM network_metrics
+       WHERE timestamp > NOW() - INTERVAL '1 hour' * $1
+       ORDER BY timestamp ASC
+       LIMIT $2`,
+      [hours, limit]
+    );
+    return result.rows;
+  }
+
+  async getEpochDurations(limit = 50) {
+    // Calculate epoch duration from advanced_at_block differences
+    const result = await this.pool.query(
+      `SELECT
+         e1.epoch,
+         e1.advanced_at_block,
+         e1.finalized_at_block,
+         e1.inflation_amount,
+         e1.validator_count,
+         CASE WHEN e2.advanced_at_block IS NOT NULL
+           THEN e1.advanced_at_block - e2.advanced_at_block
+           ELSE NULL
+         END as block_duration,
+         (SELECT COUNT(*) FROM events
+          WHERE event_name = 'ValidatorPrime'
+          AND (args->>'epoch')::bigint = e1.epoch
+         ) as prime_count,
+         (SELECT COUNT(*) FROM events
+          WHERE category = 'slashing'
+          AND block_number >= COALESCE(e2.advanced_at_block, 0)
+          AND block_number < e1.advanced_at_block
+         ) as slash_count_in_epoch
+       FROM epochs e1
+       LEFT JOIN epochs e2 ON e2.epoch = e1.epoch - 1
+       ORDER BY e1.epoch DESC
+       LIMIT $1`,
+      [limit]
+    );
+    return result.rows;
+  }
+
+  async getThroughputStats(hours = 24) {
+    // Events per hour for the last N hours
+    const result = await this.pool.query(
+      `SELECT
+         date_trunc('hour', block_timestamp) as hour,
+         COUNT(*) as total_events,
+         COUNT(*) FILTER (WHERE category = 'validator_lifecycle') as validator_events,
+         COUNT(*) FILTER (WHERE category = 'delegator_lifecycle') as delegator_events,
+         COUNT(*) FILTER (WHERE category = 'slashing') as slashing_events,
+         COUNT(*) FILTER (WHERE category = 'epoch') as epoch_events,
+         COUNT(*) FILTER (WHERE category = 'economics') as economics_events
+       FROM events
+       WHERE block_timestamp > NOW() - INTERVAL '1 hour' * $1
+       GROUP BY date_trunc('hour', block_timestamp)
+       ORDER BY hour ASC`,
+      [hours]
     );
     return result.rows;
   }

@@ -61,7 +61,24 @@ CREATE TABLE IF NOT EXISTS delegations (
   UNIQUE(validator_address, delegator_address)
 );
 
+-- Network metrics snapshots (for dashboard time-series)
+CREATE TABLE IF NOT EXISTS network_metrics (
+  id BIGSERIAL PRIMARY KEY,
+  timestamp TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+  block_number BIGINT NOT NULL,
+  active_validators INTEGER NOT NULL DEFAULT 0,
+  banned_validators INTEGER NOT NULL DEFAULT 0,
+  quarantined_validators INTEGER NOT NULL DEFAULT 0,
+  total_staked NUMERIC NOT NULL DEFAULT 0,
+  epoch BIGINT,
+  events_in_window INTEGER NOT NULL DEFAULT 0,
+  rpc_latency_avg_ms INTEGER,
+  rpc_latency_p95_ms INTEGER
+);
+
 -- Indexes for common queries
+CREATE INDEX IF NOT EXISTS idx_metrics_timestamp ON network_metrics(timestamp);
+CREATE INDEX IF NOT EXISTS idx_metrics_block ON network_metrics(block_number);
 CREATE INDEX IF NOT EXISTS idx_events_block ON events(block_number);
 CREATE INDEX IF NOT EXISTS idx_events_name ON events(event_name);
 CREATE INDEX IF NOT EXISTS idx_events_category ON events(category);
