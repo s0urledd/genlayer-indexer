@@ -58,10 +58,14 @@ export class Api {
     // ──────────────────────────────────────────────────────────
     // GET /health
     // ──────────────────────────────────────────────────────────
-    this.routes.set("GET /health", async () => ({
-      status: "ok",
-      timestamp: new Date().toISOString(),
-    }));
+    this.routes.set("GET /health", async () => {
+      try {
+        await this.db.ping();
+        return { status: "ok", timestamp: new Date().toISOString() };
+      } catch {
+        return { status: "degraded", timestamp: new Date().toISOString(), error: "database unreachable" };
+      }
+    });
 
     // ──────────────────────────────────────────────────────────
     // GET /stats
@@ -183,7 +187,8 @@ export class Api {
     this.routes.set("GET /validators/:address/history", async (params, parts) => {
       const address = parts[2];
       const limit = parseInt(params.get("limit") || "50");
-      return this.db.getValidatorHistory(address, limit);
+      const offset = parseInt(params.get("offset") || "0");
+      return this.db.getValidatorHistory(address, limit, offset);
     });
 
     // ──────────────────────────────────────────────────────────

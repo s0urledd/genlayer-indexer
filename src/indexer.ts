@@ -333,17 +333,9 @@ export class Indexer {
         const epoch = BigInt(args.epoch as string);
         const validatorRewards = args.validatorRewards as string;
 
-        // Get current validator to increment counters
-        const current = await this.db.getValidator(validator);
-        const newPrimeCount = (current?.prime_count || 0) + 1;
-        const newTotalRewards = (
-          BigInt(current?.total_rewards || "0") + BigInt(validatorRewards)
-        ).toString();
-
+        // Atomic increment — no read-modify-write race
+        await this.db.incrementValidatorPrime(validator, validatorRewards, epoch);
         await this.db.upsertValidator(validator, {
-          primeCount: newPrimeCount,
-          totalRewards: newTotalRewards,
-          lastPrimeEpoch: epoch,
           lastSeenBlock: blockNumber,
         });
         break;
@@ -352,17 +344,10 @@ export class Indexer {
       case "ValidatorSlash": {
         const validator = (args.validator as string).toLowerCase();
         const validatorSlashing = args.validatorSlashing as string;
-        const epoch = BigInt(args.epoch as string);
 
-        const current = await this.db.getValidator(validator);
-        const newSlashCount = (current?.slash_count || 0) + 1;
-        const newTotalSlashed = (
-          BigInt(current?.total_slashed || "0") + BigInt(validatorSlashing)
-        ).toString();
-
+        // Atomic increment — no read-modify-write race
+        await this.db.incrementValidatorSlash(validator, validatorSlashing);
         await this.db.upsertValidator(validator, {
-          slashCount: newSlashCount,
-          totalSlashed: newTotalSlashed,
           lastSeenBlock: blockNumber,
         });
         break;
@@ -687,24 +672,21 @@ export class Indexer {
       case "SlashedFromIdleness": {
         const validator = (args.validator as string).toLowerCase();
         const percentage = args.percentage as string;
-        const current = await this.db.getValidator(validator);
-        const newSlashCount = (current?.slash_count || 0) + 1;
 
         // Calculate slashed amount from percentage (basis points: 100 = 1%) and current stake
         let slashAmount = "0";
-        if (current?.total_stake && percentage) {
-          const stake = BigInt(current.total_stake);
-          const pct = BigInt(percentage);
-          slashAmount = ((stake * pct) / 10000n).toString();
+        if (percentage) {
+          const current = await this.db.getValidator(validator);
+          if (current?.total_stake) {
+            const stake = BigInt(current.total_stake);
+            const pct = BigInt(percentage);
+            slashAmount = ((stake * pct) / 10000n).toString();
+          }
         }
 
-        const newTotalSlashed = (
-          BigInt(current?.total_slashed || "0") + BigInt(slashAmount)
-        ).toString();
-
+        // Atomic increment — no read-modify-write race
+        await this.db.incrementValidatorSlash(validator, slashAmount);
         await this.db.upsertValidator(validator, {
-          slashCount: newSlashCount,
-          totalSlashed: newTotalSlashed,
           lastSeenBlock: blockNumber,
         });
         break;
