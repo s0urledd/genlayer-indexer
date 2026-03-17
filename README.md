@@ -179,6 +179,7 @@ All endpoints use the same status values:
 | `quarantined` | Temporarily restricted |
 | `banned` | Permanently banned (idleness or deterministic violation) |
 | `exiting` | In unbonding period |
+| `inactive` | Claimed stake and left the network |
 
 ---
 

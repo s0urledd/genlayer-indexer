@@ -207,10 +207,23 @@ export class Database {
   }
 
   // Atomically increment validator stake (for ValidatorDeposit)
+  // Uses upsert so deposits arriving before ValidatorJoin are not lost
   async incrementValidatorStake(address: string, amount: string) {
     await this.pool.query(
+      `INSERT INTO validators (address, total_stake, updated_at)
+       VALUES ($1, $2, NOW())
+       ON CONFLICT (address) DO UPDATE SET
+         total_stake = validators.total_stake + $2,
+         updated_at = NOW()`,
+      [address.toLowerCase(), amount]
+    );
+  }
+
+  // Atomically decrement validator stake (for ValidatorClaim withdrawal)
+  async decrementValidatorStake(address: string, amount: string) {
+    await this.pool.query(
       `UPDATE validators SET
-        total_stake = total_stake + $2,
+        total_stake = GREATEST(total_stake - $2, 0),
         updated_at = NOW()
        WHERE address = $1`,
       [address.toLowerCase(), amount]
@@ -375,6 +388,7 @@ export class Database {
         COUNT(*) FILTER (WHERE status NOT IN ('accepted', 'finalized', 'undetermined', 'cancelled')) as in_progress,
         COALESCE(AVG(rotation_count), 0) as avg_rotations,
         COALESCE(AVG(appeal_count), 0) as avg_appeals
+      FROM consensus_transactions
     `);
     return result.rows[0];
   }
@@ -496,7 +510,7 @@ export class Database {
        LEFT JOIN (
          SELECT args->>'validator' as validator,
            ROUND(COUNT(*)::numeric / GREATEST(
-             (SELECT COUNT(*) FROM epochs ORDER BY epoch DESC LIMIT 30), 1
+             (SELECT COUNT(*) FROM (SELECT 1 FROM epochs ORDER BY epoch DESC LIMIT 30) _e), 1
            ) * 100, 2) as uptime_pct
          FROM events
          WHERE event_name = 'ValidatorPrime'
@@ -1144,7 +1158,7 @@ export class Database {
        LEFT JOIN (
          SELECT args->>'validator' as validator,
            ROUND(COUNT(*)::numeric / GREATEST(
-             (SELECT COUNT(*) FROM epochs ORDER BY epoch DESC LIMIT 30), 1
+             (SELECT COUNT(*) FROM (SELECT 1 FROM epochs ORDER BY epoch DESC LIMIT 30) _e), 1
            ) * 100, 2) as uptime_pct
          FROM events
          WHERE event_name = 'ValidatorPrime'
@@ -1221,7 +1235,7 @@ export class Database {
        LEFT JOIN (
          SELECT args->>'validator' as validator,
            ROUND(COUNT(*)::numeric / GREATEST(
-             (SELECT COUNT(*) FROM epochs ORDER BY epoch DESC LIMIT 30), 1
+             (SELECT COUNT(*) FROM (SELECT 1 FROM epochs ORDER BY epoch DESC LIMIT 30) _e), 1
            ) * 100, 2) as uptime_pct
          FROM events
          WHERE event_name = 'ValidatorPrime'

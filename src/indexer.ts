@@ -162,6 +162,8 @@ export class Indexer {
       );
     }
 
+    // Only advance cursor after events are fully processed
+    // If processEvents threw, we'll re-process on next run (insertEvents uses ON CONFLICT DO NOTHING)
     await this.db.setLastBlock(contractAddress, toBlock);
   }
 
@@ -262,7 +264,9 @@ export class Indexer {
       try {
         await this.processEvent(event);
       } catch (err) {
-        console.error(`Error processing event ${event.eventName}:`, err);
+        // Log but re-throw to prevent setLastBlock from advancing past failed events
+        console.error(`Error processing event ${event.eventName} at block ${event.blockNumber}:`, err);
+        throw err;
       }
     }
   }
@@ -312,7 +316,13 @@ export class Indexer {
 
       case "ValidatorClaim": {
         const validator = (args.validator as string).toLowerCase();
+        const claimAmount = args.amount as string | undefined;
+        if (claimAmount) {
+          // Reduce stake by claimed amount (post-exit withdrawal)
+          await this.db.decrementValidatorStake(validator, claimAmount);
+        }
         await this.db.upsertValidator(validator, {
+          status: "inactive",
           lastSeenBlock: blockNumber,
         });
         break;
@@ -515,7 +525,8 @@ export class Indexer {
           voteType,
           blockNumber,
         });
-        await this.db.upsertConsensusTx(txId, { voteType });
+        // Individual vote types are stored per-validator in participation table.
+        // Don't overwrite consensus_tx.vote_type — it would only keep the last voter's type.
         break;
       }
 
@@ -616,7 +627,47 @@ export class Indexer {
         break;
       }
 
-      // Infrastructure events - stored in raw events table, no aggregation
+      // Economics events — stored in raw events table, amounts tracked via epoch/inflation
+      case "FeesReceived":
+      case "BurnToL1":
+      case "BurnFailed":
+      case "InflationInitiated":
+        break;
+
+      // Delegator claim — no delegation state change needed (just a reward withdrawal)
+      case "DelegatorClaim":
+        break;
+
+      // Epoch lifecycle events — stored in raw events
+      case "EpochZeroEnded":
+      case "EpochHasPendingTribunals":
+        break;
+
+      // Quarantine batch cleanup — individual quarantine events already tracked
+      case "QuarantinesCleanedUp":
+        break;
+
+      // Validator registration batch — individual joins already tracked
+      case "ValidatorsRegistered":
+        break;
+
+      // Governance parameter changes — stored in raw events for audit trail
+      case "SetValidatorMinimumStake":
+      case "SetDelegatorMinimumStake":
+      case "SetMaxValidators":
+      case "SetEpochMinDuration":
+      case "SetEpochMinDurationThreshold":
+      case "SetEpochZeroMinDuration":
+      case "SetValidatorWeightParams":
+      case "SetUnbondingPeriods":
+      case "SetReductionFactor":
+      case "SetGen":
+      case "SetDeepthought":
+      case "SetTransactionFeesManager":
+      case "SetStakingInvariant":
+        break;
+
+      // Infrastructure events — stored in raw events table, no aggregation
       case "CreatedTransaction":
       case "TransactionFinalizationFailed":
       case "TransactionNeedsRecomputation":
@@ -628,19 +679,23 @@ export class Indexer {
       case "AddressManagerSet":
         break;
 
+      default:
+        // Unknown event — already stored in raw events table
+        console.warn(`Unhandled event: ${eventName}`);
+        break;
+
       case "SlashedFromIdleness": {
         const validator = (args.validator as string).toLowerCase();
         const percentage = args.percentage as string;
         const current = await this.db.getValidator(validator);
         const newSlashCount = (current?.slash_count || 0) + 1;
 
-        // Calculate slashed amount from percentage and current stake
+        // Calculate slashed amount from percentage (basis points: 100 = 1%) and current stake
         let slashAmount = "0";
         if (current?.total_stake && percentage) {
           const stake = BigInt(current.total_stake);
           const pct = BigInt(percentage);
-          // percentage is in basis points or direct - divide by 100
-          slashAmount = ((stake * pct) / 100n).toString();
+          slashAmount = ((stake * pct) / 10000n).toString();
         }
 
         const newTotalSlashed = (
