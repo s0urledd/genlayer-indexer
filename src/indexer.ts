@@ -50,6 +50,11 @@ export class Indexer {
     console.log(`  RPC: ${config.rpcUrl}`);
     console.log(`  Staking contract: ${config.stakingContract}`);
     console.log(`  Consensus contract: ${config.consensusContract}`);
+    if (config.slashingContract) {
+      console.log(`  Slashing contract: ${config.slashingContract}`);
+    } else {
+      console.log(`  Slashing contract: NOT CONFIGURED (SlashedFromIdleness events will not be indexed)`);
+    }
     console.log(`  Batch size: ${config.batchSize}`);
     console.log(`  Poll interval: ${config.pollIntervalMs}ms`);
 
@@ -73,8 +78,8 @@ export class Indexer {
   private async indexBatch() {
     const currentBlock = await this.measureRpc("ping", () => this.client.getBlockNumber());
 
-    // Index both contracts in parallel for ~2x faster catch-up
-    await Promise.all([
+    // Index contracts in parallel
+    const contracts: Array<Promise<void>> = [
       this.indexContract(
         config.stakingContract,
         STAKING_EVENTS_ABI as unknown as AbiEvent[],
@@ -82,10 +87,21 @@ export class Indexer {
       ),
       this.indexContract(
         config.consensusContract,
-        [...SLASHING_EVENTS_ABI, ...CONSENSUS_EVENTS_ABI] as unknown as AbiEvent[],
+        CONSENSUS_EVENTS_ABI as unknown as AbiEvent[],
         currentBlock
       ),
-    ]);
+    ];
+    // Slashing contract is separate — only index if configured
+    if (config.slashingContract) {
+      contracts.push(
+        this.indexContract(
+          config.slashingContract,
+          SLASHING_EVENTS_ABI as unknown as AbiEvent[],
+          currentBlock
+        )
+      );
+    }
+    await Promise.all(contracts);
 
     // Record metrics snapshot periodically
     this.batchCount++;
@@ -399,9 +415,12 @@ export class Indexer {
 
       case "EpochAdvance": {
         const epoch = BigInt(args.epoch as string);
+        // Snapshot current active validator count at epoch boundary
+        const activeCount = await this.db.getActiveValidatorCount();
         await this.db.upsertEpoch(epoch, {
           advancedAtBlock: blockNumber,
           advancedAtTimestamp: event.blockTimestamp,
+          validatorCount: activeCount,
         });
         break;
       }

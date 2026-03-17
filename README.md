@@ -21,20 +21,36 @@ npm run migrate
 npm run dev
 ```
 
+## Protocol Overview
+
+GenLayer uses **Optimistic Democracy** consensus — a leader proposes a transaction result, a validator committee verifies it via commit-reveal voting. Disagreements trigger **appeals** with progressively larger validator sets (doubling each round). Non-deterministic operations (LLM calls, web reads) are compared using the **Equivalence Principle** — outputs need only be semantically equivalent, not identical.
+
+Key protocol parameters:
+- **Minimum validator stake:** 42,000 GEN (waived during Epoch 0 bootstrap)
+- **Minimum delegation:** 42 GEN
+- **Max active validators:** 1,000 per epoch
+- **Unbonding period:** 7 epochs (validators and delegators)
+- **Deposit activation:** 2-epoch delay (staged at N+1, active at N+2)
+- **Validator weight:** `(alpha × self_stake + (1-alpha) × delegated_stake)^beta` where alpha=0.6, beta=0.5
+- **Reward split:** 10% operators, 75% stake pool, 10% developers, 5% DeepThought AI-DAO
+
 ## Architecture
 
-The indexer tracks two on-chain contracts in parallel:
+The indexer tracks up to three on-chain contracts in parallel:
 
 | Contract | Address | Events |
 |----------|---------|--------|
 | **Staking** | `0x4A4449...E821A5` | 38 events — validator/delegator lifecycle, epochs, economics, governance |
-| **ConsensusMain** | `0x0112Bf...004271D` | 27 events — transaction lifecycle, voting, appeals, rotation, slashing |
+| **ConsensusMain** | `0x0112Bf...004271D` | 26 events — transaction lifecycle, voting, appeals, rotation |
+| **Slashing** | Discovered via `staking.getSlashingAddress()` | 1 event — `SlashedFromIdleness` |
+
+> The slashing contract is separate from consensus. Set `SLASHING_CONTRACT` in `.env` to index `SlashedFromIdleness` events.
 
 Data flows into 7 PostgreSQL tables:
 
 - `events` — Raw event log (all 65 events, JSONB args)
 - `validators` — Aggregated validator state (stake, rewards, slashes, status)
-- `epochs` — Epoch timeline with timestamps
+- `epochs` — Epoch timeline with timestamps and validator_count snapshot
 - `delegations` — Delegator deposits/withdrawals per validator
 - `consensus_transactions` — Transaction lifecycle (status, leader, rotations, appeals)
 - `validator_tx_participation` — Per-validator role and vote on each transaction
@@ -242,6 +258,7 @@ All settings via `.env`:
 | `RPC_URL` | `https://zksync-os-testnet-genlayer.zksync.dev` | GenLayer chain RPC |
 | `STAKING_CONTRACT` | `0x4A4449E617F8D10FDeD0b461CadEf83939E821A5` | Staking contract address |
 | `CONSENSUS_CONTRACT` | `0x0112Bf6e83497965A5fdD6Dad1E447a6E004271D` | ConsensusMain contract address |
+| `SLASHING_CONTRACT` | *(empty)* | Slashing contract address (from `staking.getSlashingAddress()`) |
 | `DATABASE_URL` | `postgresql://genlayer:genlayer@localhost:5432/genlayer_indexer` | PostgreSQL connection |
 | `BATCH_SIZE` | `1000` | Blocks per indexing batch |
 | `POLL_INTERVAL_MS` | `5000` | Polling interval in ms |
@@ -263,7 +280,14 @@ Then restart the indexer. Staking data remains intact.
 ## Indexed Events (65 total)
 
 - **38** events from the Staking contract
-- **1** from the Slashing contract (`SlashedFromIdleness`)
+- **1** from the Slashing contract (`SlashedFromIdleness`) — requires `SLASHING_CONTRACT` to be set
 - **26** from the ConsensusMain contract
 
 ABI sources: `genlayer-js` SDK (`STAKING_ABI` + `testnetBradbury.ts` ConsensusMain ABI).
+
+## Known Limitations
+
+- **Slashing contract address** must be manually configured — auto-discovery via `staking.getSlashingAddress()` is not yet implemented
+- **Deposit activation delay** (2 epochs) is a protocol detail not tracked in the indexer — the stake appears immediately upon `ValidatorJoin`/`ValidatorDeposit`
+- **Validator shares vs stake** — the indexer tracks GEN amounts, not share counts. The share-based accounting (where `stake_per_share` changes with rewards/slashing) is abstracted away
+- **No test suite** — the repository currently has no automated tests

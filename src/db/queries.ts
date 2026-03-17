@@ -16,6 +16,13 @@ export class Database {
     await this.pool.query("SELECT 1");
   }
 
+  async getActiveValidatorCount(): Promise<number> {
+    const result = await this.pool.query(
+      "SELECT COUNT(*) as count FROM validators WHERE status = 'active'"
+    );
+    return parseInt(result.rows[0].count);
+  }
+
   // ============================================================
   // Indexer State
   // ============================================================
