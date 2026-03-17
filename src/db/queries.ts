@@ -1,5 +1,5 @@
 import pg from "pg";
-import { EVENT_CATEGORIES } from "../abi.js";
+import { EVENT_CATEGORIES, VOTE_TYPES, TX_STATUSES } from "../abi.js";
 
 export class Database {
   private pool: pg.Pool;
@@ -178,22 +178,28 @@ export class Database {
   async upsertEpoch(epoch: bigint, data: Partial<{
     advancedAtBlock: bigint;
     finalizedAtBlock: bigint;
+    advancedAtTimestamp: Date;
+    finalizedAtTimestamp: Date;
     inflationAmount: string;
     validatorCount: number;
   }>) {
     await this.pool.query(
-      `INSERT INTO epochs (epoch, advanced_at_block, finalized_at_block, inflation_amount, validator_count, updated_at)
-       VALUES ($1, $2, $3, $4, $5, NOW())
+      `INSERT INTO epochs (epoch, advanced_at_block, finalized_at_block, advanced_at_timestamp, finalized_at_timestamp, inflation_amount, validator_count, updated_at)
+       VALUES ($1, $2, $3, $4, $5, $6, $7, NOW())
        ON CONFLICT (epoch) DO UPDATE SET
          advanced_at_block = COALESCE($2, epochs.advanced_at_block),
          finalized_at_block = COALESCE($3, epochs.finalized_at_block),
-         inflation_amount = COALESCE($4, epochs.inflation_amount),
-         validator_count = COALESCE($5, epochs.validator_count),
+         advanced_at_timestamp = COALESCE($4, epochs.advanced_at_timestamp),
+         finalized_at_timestamp = COALESCE($5, epochs.finalized_at_timestamp),
+         inflation_amount = COALESCE($6, epochs.inflation_amount),
+         validator_count = COALESCE($7, epochs.validator_count),
          updated_at = NOW()`,
       [
         epoch.toString(),
         data.advancedAtBlock?.toString() || null,
         data.finalizedAtBlock?.toString() || null,
+        data.advancedAtTimestamp || null,
+        data.finalizedAtTimestamp || null,
         data.inflationAmount || null,
         data.validatorCount ?? null,
       ]
@@ -239,6 +245,138 @@ export class Database {
         withdrawDelta,
       ]
     );
+  }
+
+  // ============================================================
+  // Consensus Transaction Aggregation
+  // ============================================================
+
+  async upsertConsensusTx(txId: string, data: Partial<{
+    recipient: string;
+    activator: string;
+    leader: string;
+    status: string;
+    voteType: string;
+    resultType: string;
+    rotationCount: number;
+    appealCount: number;
+    validators: string[];
+    createdAtBlock: bigint;
+    createdAtTimestamp: Date;
+    acceptedAtBlock: bigint;
+    finalizedAtBlock: bigint;
+  }>) {
+    await this.pool.query(
+      `INSERT INTO consensus_transactions (tx_id, recipient, activator, leader, status, vote_type, result_type, rotation_count, appeal_count, validators, created_at_block, created_at_timestamp, accepted_at_block, finalized_at_block, updated_at)
+       VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, NOW())
+       ON CONFLICT (tx_id) DO UPDATE SET
+         recipient = COALESCE($2, consensus_transactions.recipient),
+         activator = COALESCE($3, consensus_transactions.activator),
+         leader = COALESCE($4, consensus_transactions.leader),
+         status = COALESCE($5, consensus_transactions.status),
+         vote_type = COALESCE($6, consensus_transactions.vote_type),
+         result_type = COALESCE($7, consensus_transactions.result_type),
+         rotation_count = COALESCE($8, consensus_transactions.rotation_count),
+         appeal_count = COALESCE($9, consensus_transactions.appeal_count),
+         validators = COALESCE($10, consensus_transactions.validators),
+         created_at_block = COALESCE($11, consensus_transactions.created_at_block),
+         created_at_timestamp = COALESCE($12, consensus_transactions.created_at_timestamp),
+         accepted_at_block = COALESCE($13, consensus_transactions.accepted_at_block),
+         finalized_at_block = COALESCE($14, consensus_transactions.finalized_at_block),
+         updated_at = NOW()`,
+      [
+        txId,
+        data.recipient?.toLowerCase() || null,
+        data.activator?.toLowerCase() || null,
+        data.leader?.toLowerCase() || null,
+        data.status || null,
+        data.voteType || null,
+        data.resultType || null,
+        data.rotationCount ?? null,
+        data.appealCount ?? null,
+        data.validators ? `{${data.validators.map(v => v.toLowerCase()).join(",")}}` : null,
+        data.createdAtBlock?.toString() || null,
+        data.createdAtTimestamp || null,
+        data.acceptedAtBlock?.toString() || null,
+        data.finalizedAtBlock?.toString() || null,
+      ]
+    );
+  }
+
+  async incrementConsensusTxRotation(txId: string) {
+    await this.pool.query(
+      `UPDATE consensus_transactions SET rotation_count = rotation_count + 1, updated_at = NOW() WHERE tx_id = $1`,
+      [txId]
+    );
+  }
+
+  async incrementConsensusTxAppeal(txId: string) {
+    await this.pool.query(
+      `UPDATE consensus_transactions SET appeal_count = appeal_count + 1, updated_at = NOW() WHERE tx_id = $1`,
+      [txId]
+    );
+  }
+
+  async upsertValidatorTxParticipation(txId: string, validator: string, data: Partial<{
+    role: string;
+    voteType: string;
+    voteCommitted: boolean;
+    voteRevealed: boolean;
+    blockNumber: bigint;
+  }>) {
+    await this.pool.query(
+      `INSERT INTO validator_tx_participation (tx_id, validator, role, vote_type, vote_committed, vote_revealed, block_number, updated_at)
+       VALUES ($1, $2, $3, $4, $5, $6, $7, NOW())
+       ON CONFLICT (tx_id, validator) DO UPDATE SET
+         role = COALESCE($3, validator_tx_participation.role),
+         vote_type = COALESCE($4, validator_tx_participation.vote_type),
+         vote_committed = COALESCE($5, validator_tx_participation.vote_committed),
+         vote_revealed = COALESCE($6, validator_tx_participation.vote_revealed),
+         block_number = COALESCE($7, validator_tx_participation.block_number),
+         updated_at = NOW()`,
+      [
+        txId,
+        validator.toLowerCase(),
+        data.role || null,
+        data.voteType || null,
+        data.voteCommitted ?? null,
+        data.voteRevealed ?? null,
+        data.blockNumber?.toString() || null,
+      ]
+    );
+  }
+
+  // ============================================================
+  // Consensus Transaction Queries
+  // ============================================================
+
+  async getConsensusTxForValidator(validator: string, limit = 50, offset = 0) {
+    const result = await this.pool.query(
+      `SELECT ct.*, vtp.role, vtp.vote_type as validator_vote_type,
+         vtp.vote_committed, vtp.vote_revealed
+       FROM consensus_transactions ct
+       INNER JOIN validator_tx_participation vtp ON vtp.tx_id = ct.tx_id
+       WHERE vtp.validator = $1
+       ORDER BY ct.created_at_block DESC NULLS LAST
+       LIMIT $2 OFFSET $3`,
+      [validator.toLowerCase(), limit, offset]
+    );
+    return result.rows;
+  }
+
+  async getConsensusTxStats() {
+    const result = await this.pool.query(`
+      SELECT
+        COUNT(*) as total_transactions,
+        COUNT(*) FILTER (WHERE status = 'accepted') as accepted,
+        COUNT(*) FILTER (WHERE status = 'finalized') as finalized,
+        COUNT(*) FILTER (WHERE status = 'undetermined') as undetermined,
+        COUNT(*) FILTER (WHERE status = 'cancelled') as cancelled,
+        COUNT(*) FILTER (WHERE status NOT IN ('accepted', 'finalized', 'undetermined', 'cancelled')) as in_progress,
+        COALESCE(AVG(rotation_count), 0) as avg_rotations,
+        COALESCE(AVG(appeal_count), 0) as avg_appeals
+    `);
+    return result.rows[0];
   }
 
   // ============================================================
@@ -329,7 +467,7 @@ export class Database {
     let paramIndex = 1;
 
     if (params?.status) {
-      conditions.push(`status = $${paramIndex++}`);
+      conditions.push(`v.status = $${paramIndex++}`);
       values.push(params.status);
     }
 
@@ -338,8 +476,37 @@ export class Database {
     const offset = params?.offset || 0;
 
     const result = await this.pool.query(
-      `SELECT * FROM validators ${where}
-       ORDER BY total_stake DESC
+      `SELECT v.*,
+        COALESCE(d.delegated_stake, 0) as delegated_stake,
+        COALESCE(d.delegator_count, 0) as delegator_count,
+        v.total_stake - COALESCE(d.delegated_stake, 0) as self_stake,
+        CASE WHEN v.prime_count + v.slash_count > 0
+          THEN ROUND(v.prime_count::numeric / (v.prime_count + v.slash_count) * 100, 2)
+          ELSE 100
+        END as participation_score,
+        COALESCE(u.uptime_pct, 100) as uptime_percentage
+       FROM validators v
+       LEFT JOIN (
+         SELECT validator_address,
+           SUM(total_deposited - total_withdrawn) as delegated_stake,
+           COUNT(*) FILTER (WHERE total_deposited > total_withdrawn) as delegator_count
+         FROM delegations
+         GROUP BY validator_address
+       ) d ON d.validator_address = v.address
+       LEFT JOIN (
+         SELECT args->>'validator' as validator,
+           ROUND(COUNT(*)::numeric / GREATEST(
+             (SELECT COUNT(*) FROM epochs ORDER BY epoch DESC LIMIT 30), 1
+           ) * 100, 2) as uptime_pct
+         FROM events
+         WHERE event_name = 'ValidatorPrime'
+           AND (args->>'epoch')::bigint >= COALESCE(
+             (SELECT MAX(epoch) - 29 FROM epochs), 0
+           )
+         GROUP BY args->>'validator'
+       ) u ON u.validator = v.address
+       ${where}
+       ORDER BY v.total_stake DESC
        LIMIT $${paramIndex++} OFFSET $${paramIndex++}`,
       [...values, limit, offset]
     );
@@ -348,7 +515,23 @@ export class Database {
 
   async getValidator(address: string) {
     const result = await this.pool.query(
-      "SELECT * FROM validators WHERE address = $1",
+      `SELECT v.*,
+        COALESCE(d.delegated_stake, 0) as delegated_stake,
+        COALESCE(d.delegator_count, 0) as delegator_count,
+        v.total_stake - COALESCE(d.delegated_stake, 0) as self_stake,
+        CASE WHEN v.prime_count + v.slash_count > 0
+          THEN ROUND(v.prime_count::numeric / (v.prime_count + v.slash_count) * 100, 2)
+          ELSE 100
+        END as participation_score
+       FROM validators v
+       LEFT JOIN (
+         SELECT validator_address,
+           SUM(total_deposited - total_withdrawn) as delegated_stake,
+           COUNT(*) FILTER (WHERE total_deposited > total_withdrawn) as delegator_count
+         FROM delegations
+         GROUP BY validator_address
+       ) d ON d.validator_address = v.address
+       WHERE v.address = $1`,
       [address.toLowerCase()]
     );
     return result.rows[0] || null;
@@ -430,7 +613,16 @@ export class Database {
         (SELECT COUNT(*) FROM events WHERE block_timestamp > NOW() - INTERVAL '1 hour') as events_last_hour,
         (SELECT COUNT(*) FROM events WHERE block_timestamp > NOW() - INTERVAL '24 hours') as events_last_24h,
         (SELECT COUNT(*) FROM delegations) as total_delegations,
-        (SELECT COALESCE(SUM(total_deposited - total_withdrawn), 0) FROM delegations) as total_delegated
+        (SELECT COALESCE(SUM(total_deposited - total_withdrawn), 0) FROM delegations) as total_delegated,
+        (SELECT CASE WHEN COALESCE(SUM(total_stake), 0) > 0 AND MAX(epoch) > 0
+          THEN ROUND(
+            COALESCE(SUM(total_rewards), 0) / COALESCE(SUM(total_stake), 1) *
+            (365.0 / GREATEST(MAX(epoch), 1)) * 100, 2
+          )
+          ELSE 0
+        END FROM validators
+        CROSS JOIN (SELECT MAX(epoch) as epoch FROM epochs) ep
+        ) as estimated_apy
     `);
     return result.rows[0];
   }
@@ -518,6 +710,45 @@ export class Database {
       [limit]
     );
     return result.rows;
+  }
+
+  async getNetworkUptimeByEpoch(epochCount = 30) {
+    const result = await this.pool.query(
+      `SELECT
+         e.epoch,
+         e.advanced_at_block,
+         e.finalized_at_block,
+         COALESCE(p.primed_count, 0) as primed_validators,
+         COALESCE(e.validator_count,
+           (SELECT COUNT(*) FROM validators WHERE status = 'active')
+         ) as total_validators,
+         CASE WHEN COALESCE(e.validator_count,
+           (SELECT COUNT(*) FROM validators WHERE status = 'active')
+         ) > 0
+           THEN ROUND(
+             COALESCE(p.primed_count, 0)::numeric /
+             COALESCE(e.validator_count,
+               (SELECT COUNT(*) FROM validators WHERE status = 'active')
+             ) * 100, 2
+           )
+           ELSE 0
+         END as uptime_percentage
+       FROM epochs e
+       LEFT JOIN (
+         SELECT (args->>'epoch')::bigint as epoch, COUNT(DISTINCT args->>'validator') as primed_count
+         FROM events
+         WHERE event_name = 'ValidatorPrime'
+         GROUP BY (args->>'epoch')::bigint
+       ) p ON p.epoch = e.epoch
+       ORDER BY e.epoch DESC
+       LIMIT $1`,
+      [epochCount]
+    );
+    const rows = result.rows;
+    const avgUptime = rows.length > 0
+      ? (rows.reduce((sum: number, r: { uptime_percentage: string }) => sum + parseFloat(r.uptime_percentage), 0) / rows.length).toFixed(2)
+      : "0.00";
+    return { avgUptime, epochs: rows };
   }
 
   async getThroughputStats(hours = 24) {

@@ -45,6 +45,8 @@ CREATE TABLE IF NOT EXISTS epochs (
   epoch BIGINT PRIMARY KEY,
   advanced_at_block BIGINT,
   finalized_at_block BIGINT,
+  advanced_at_timestamp TIMESTAMPTZ,
+  finalized_at_timestamp TIMESTAMPTZ,
   inflation_amount NUMERIC,
   validator_count INTEGER,
   updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
@@ -75,6 +77,52 @@ CREATE TABLE IF NOT EXISTS network_metrics (
   rpc_latency_avg_ms INTEGER,
   rpc_latency_p95_ms INTEGER
 );
+
+-- Consensus transactions (materialized from consensus contract events)
+CREATE TABLE IF NOT EXISTS consensus_transactions (
+  tx_id TEXT PRIMARY KEY,
+  recipient TEXT,
+  activator TEXT,
+  leader TEXT,
+  status TEXT NOT NULL DEFAULT 'pending',
+  vote_type TEXT,
+  result_type TEXT,
+  rotation_count INTEGER NOT NULL DEFAULT 0,
+  appeal_count INTEGER NOT NULL DEFAULT 0,
+  validators TEXT[] DEFAULT '{}',
+  created_at_block BIGINT,
+  created_at_timestamp TIMESTAMPTZ,
+  accepted_at_block BIGINT,
+  finalized_at_block BIGINT,
+  updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+
+-- Validator-transaction participation (which validators voted on which txs)
+CREATE TABLE IF NOT EXISTS validator_tx_participation (
+  id BIGSERIAL PRIMARY KEY,
+  tx_id TEXT NOT NULL,
+  validator TEXT NOT NULL,
+  role TEXT NOT NULL DEFAULT 'validator',
+  vote_type TEXT,
+  vote_committed BOOLEAN NOT NULL DEFAULT false,
+  vote_revealed BOOLEAN NOT NULL DEFAULT false,
+  block_number BIGINT,
+  updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+  UNIQUE(tx_id, validator)
+);
+
+CREATE INDEX IF NOT EXISTS idx_consensus_tx_status ON consensus_transactions(status);
+CREATE INDEX IF NOT EXISTS idx_consensus_tx_leader ON consensus_transactions(leader);
+CREATE INDEX IF NOT EXISTS idx_consensus_tx_recipient ON consensus_transactions(recipient);
+CREATE INDEX IF NOT EXISTS idx_vtx_validator ON validator_tx_participation(validator);
+CREATE INDEX IF NOT EXISTS idx_vtx_txid ON validator_tx_participation(tx_id);
+
+-- Add timestamp columns to epochs if missing (for existing databases)
+DO $$ BEGIN
+  ALTER TABLE epochs ADD COLUMN IF NOT EXISTS advanced_at_timestamp TIMESTAMPTZ;
+  ALTER TABLE epochs ADD COLUMN IF NOT EXISTS finalized_at_timestamp TIMESTAMPTZ;
+EXCEPTION WHEN others THEN NULL;
+END $$;
 
 -- Indexes for common queries
 CREATE INDEX IF NOT EXISTS idx_metrics_timestamp ON network_metrics(timestamp);

@@ -24,6 +24,7 @@ export class Api {
       console.log("Available endpoints:");
       console.log("  GET /health                          - Health check");
       console.log("  GET /stats                           - Network overview stats");
+      console.log("  GET /stats/network-uptime             - Per-epoch network uptime");
       console.log("  GET /stats/timeline                  - Historical metrics time-series");
       console.log("  GET /stats/throughput                - Event throughput by hour");
       console.log("  GET /stats/latency                   - Live RPC latency metrics");
@@ -32,6 +33,8 @@ export class Api {
       console.log("  GET /validators/:address/history     - Validator event history");
       console.log("  GET /validators/:address/uptime      - Epoch-by-epoch uptime");
       console.log("  GET /validators/:address/delegations - Delegations for validator");
+      console.log("  GET /validators/:address/transactions - Consensus tx participation");
+      console.log("  GET /consensus/stats                 - Consensus transaction stats");
       console.log("  GET /epochs                          - List epochs");
       console.log("  GET /epochs/:epoch                   - Single epoch details");
       console.log("  GET /epochs/durations                - Epoch duration analysis");
@@ -229,6 +232,42 @@ export class Api {
     });
 
     // ──────────────────────────────────────────────────────────
+    // GET /validators/:address/transactions
+    // Consensus transactions this validator participated in
+    // Query params:
+    //   ?limit=50   (default 50)
+    //   ?offset=0   (default 0)
+    // ──────────────────────────────────────────────────────────
+    this.routes.set(
+      "GET /validators/:address/transactions",
+      async (params, parts) => {
+        const address = parts[2];
+        const limit = parseInt(params.get("limit") || "50");
+        const offset = parseInt(params.get("offset") || "0");
+        return this.db.getConsensusTxForValidator(address, limit, offset);
+      }
+    );
+
+    // ──────────────────────────────────────────────────────────
+    // GET /consensus/stats
+    // Consensus transaction statistics
+    // ──────────────────────────────────────────────────────────
+    this.routes.set("GET /consensus/stats", async () => {
+      return this.db.getConsensusTxStats();
+    });
+
+    // ──────────────────────────────────────────────────────────
+    // GET /stats/network-uptime
+    // Per-epoch network uptime (% of validators that primed)
+    // Query params:
+    //   ?epochs=30  (default 30)
+    // ──────────────────────────────────────────────────────────
+    this.routes.set("GET /stats/network-uptime", async (params) => {
+      const epochCount = parseInt(params.get("epochs") || "30");
+      return this.db.getNetworkUptimeByEpoch(epochCount);
+    });
+
+    // ──────────────────────────────────────────────────────────
     // GET /stats/timeline
     // Network metrics time-series for dashboard charts
     // Query params:
@@ -305,6 +344,7 @@ export class Api {
           availableEndpoints: [
             "GET /health",
             "GET /stats",
+            "GET /stats/network-uptime",
             "GET /stats/timeline",
             "GET /stats/throughput",
             "GET /stats/latency",
@@ -313,6 +353,8 @@ export class Api {
             "GET /validators/:address/history",
             "GET /validators/:address/uptime",
             "GET /validators/:address/delegations",
+            "GET /validators/:address/transactions",
+            "GET /consensus/stats",
             "GET /epochs",
             "GET /epochs/:epoch",
             "GET /epochs/durations",
@@ -370,6 +412,20 @@ export class Api {
       pathParts[2] === "delegations"
     ) {
       return this.routes.get("GET /validators/:address/delegations")!;
+    }
+
+    // /validators/:address/transactions
+    if (
+      pathParts.length === 3 &&
+      pathParts[0] === "validators" &&
+      pathParts[2] === "transactions"
+    ) {
+      return this.routes.get("GET /validators/:address/transactions")!;
+    }
+
+    // /consensus/stats
+    if (pathParts.length === 2 && pathParts[0] === "consensus" && pathParts[1] === "stats") {
+      return this.routes.get("GET /consensus/stats")!;
     }
 
     // /validators/:address
