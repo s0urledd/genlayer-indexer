@@ -1,6 +1,21 @@
 import pg from "pg";
 import { EVENT_CATEGORIES, VOTE_TYPES, TX_STATUSES } from "../abi.js";
 
+const ZERO_ADDRESS = "0x0000000000000000000000000000000000000000";
+
+/** Lowercase all Ethereum address values in an args object for consistent storage */
+function normalizeArgs(args: Record<string, unknown>): Record<string, unknown> {
+  const result: Record<string, unknown> = {};
+  for (const [key, value] of Object.entries(args)) {
+    if (typeof value === "string" && /^0x[0-9a-fA-F]{40}$/.test(value)) {
+      result[key] = value.toLowerCase();
+    } else {
+      result[key] = value;
+    }
+  }
+  return result;
+}
+
 export class Database {
   private pool: pg.Pool;
 
@@ -18,7 +33,7 @@ export class Database {
 
   async getActiveValidatorCount(): Promise<number> {
     const result = await this.pool.query(
-      "SELECT COUNT(*) as count FROM validators WHERE status = 'active'"
+      `SELECT COUNT(*) as count FROM validators WHERE status = 'active' AND address != '${ZERO_ADDRESS}'`
     );
     return parseInt(result.rows[0].count);
   }
@@ -58,6 +73,7 @@ export class Database {
     blockTimestamp?: Date;
   }) {
     const category = EVENT_CATEGORIES[event.eventName] || "unknown";
+    const normalized = normalizeArgs(event.args);
     await this.pool.query(
       `INSERT INTO events (block_number, tx_hash, log_index, contract_address, event_name, category, args, block_timestamp)
        VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
@@ -69,7 +85,7 @@ export class Database {
         event.contractAddress.toLowerCase(),
         event.eventName,
         category,
-        JSON.stringify(event.args, (_key, value) =>
+        JSON.stringify(normalized, (_key, value) =>
           typeof value === "bigint" ? value.toString() : value
         ),
         event.blockTimestamp || null,
@@ -104,6 +120,7 @@ export class Database {
         for (let j = 0; j < chunk.length; j++) {
           const event = chunk[j];
           const category = EVENT_CATEGORIES[event.eventName] || "unknown";
+          const normalized = normalizeArgs(event.args);
           const base = j * 8;
           placeholders.push(
             `($${base + 1}, $${base + 2}, $${base + 3}, $${base + 4}, $${base + 5}, $${base + 6}, $${base + 7}, $${base + 8})`
@@ -115,7 +132,7 @@ export class Database {
             event.contractAddress.toLowerCase(),
             event.eventName,
             category,
-            JSON.stringify(event.args, (_key, value) =>
+            JSON.stringify(normalized, (_key, value) =>
               typeof value === "bigint" ? value.toString() : value
             ),
             event.blockTimestamp || null,
@@ -525,7 +542,7 @@ export class Database {
       values.push(params.category);
     }
     if (params.validator) {
-      conditions.push(`args->>'validator' = $${paramIndex++}`);
+      conditions.push(`LOWER(args->>'validator') = $${paramIndex++}`);
       values.push(params.validator.toLowerCase());
     }
     if (params.fromBlock !== undefined) {
@@ -569,7 +586,7 @@ export class Database {
       values.push(params.category);
     }
     if (params.validator) {
-      conditions.push(`args->>'validator' = $${paramIndex++}`);
+      conditions.push(`LOWER(args->>'validator') = $${paramIndex++}`);
       values.push(params.validator.toLowerCase());
     }
 
@@ -582,7 +599,7 @@ export class Database {
   }
 
   async getValidators(params?: { status?: string; limit?: number; offset?: number }) {
-    const conditions: string[] = [];
+    const conditions: string[] = [`v.address != '${ZERO_ADDRESS}'`];
     const values: unknown[] = [];
     let paramIndex = 1;
 
@@ -591,7 +608,7 @@ export class Database {
       values.push(params.status);
     }
 
-    const where = conditions.length > 0 ? `WHERE ${conditions.join(" AND ")}` : "";
+    const where = `WHERE ${conditions.join(" AND ")}`;
     const limit = params?.limit || 100;
     const offset = params?.offset || 0;
 
@@ -614,7 +631,7 @@ export class Database {
          GROUP BY validator_address
        ) d ON d.validator_address = v.address
        LEFT JOIN (
-         SELECT args->>'validator' as validator,
+         SELECT LOWER(args->>'validator') as validator,
            ROUND(COUNT(*)::numeric / GREATEST(
              (SELECT COUNT(*) FROM (SELECT 1 FROM epochs ORDER BY epoch DESC LIMIT 30) _e), 1
            ) * 100, 2) as uptime_pct
@@ -623,7 +640,7 @@ export class Database {
            AND (args->>'epoch')::bigint >= COALESCE(
              (SELECT MAX(epoch) - 29 FROM epochs), 0
            )
-         GROUP BY args->>'validator'
+         GROUP BY LOWER(args->>'validator')
        ) u ON u.validator = v.address
        ${where}
        ORDER BY v.total_stake DESC
@@ -660,7 +677,7 @@ export class Database {
   async getValidatorHistory(address: string, limit = 50, offset = 0) {
     const result = await this.pool.query(
       `SELECT * FROM events
-       WHERE args->>'validator' = $1
+       WHERE LOWER(args->>'validator') = $1
        ORDER BY block_number DESC, log_index DESC
        LIMIT $2 OFFSET $3`,
       [address.toLowerCase(), limit, offset]
@@ -717,16 +734,17 @@ export class Database {
   }
 
   async getNetworkStats() {
+    const zeroAddr = ZERO_ADDRESS;
     const result = await this.pool.query(`
       SELECT
-        (SELECT COUNT(*) FROM validators) as total_validators,
-        (SELECT COUNT(*) FROM validators WHERE status = 'active') as active_validators,
-        (SELECT COUNT(*) FROM validators WHERE status = 'banned') as banned_validators,
-        (SELECT COUNT(*) FROM validators WHERE status = 'quarantined') as quarantined_validators,
-        (SELECT COUNT(*) FROM validators WHERE status = 'exiting') as exiting_validators,
-        (SELECT COALESCE(SUM(total_stake), 0) FROM validators) as total_staked,
-        (SELECT COALESCE(SUM(total_rewards), 0) FROM validators) as total_rewards_distributed,
-        (SELECT COALESCE(SUM(total_slashed), 0) FROM validators) as total_slashed,
+        (SELECT COUNT(*) FROM validators WHERE address != '${zeroAddr}') as total_validators,
+        (SELECT COUNT(*) FROM validators WHERE status = 'active' AND address != '${zeroAddr}') as active_validators,
+        (SELECT COUNT(*) FROM validators WHERE status = 'banned' AND address != '${zeroAddr}') as banned_validators,
+        (SELECT COUNT(*) FROM validators WHERE status = 'quarantined' AND address != '${zeroAddr}') as quarantined_validators,
+        (SELECT COUNT(*) FROM validators WHERE status = 'exiting' AND address != '${zeroAddr}') as exiting_validators,
+        (SELECT COALESCE(SUM(total_stake), 0) FROM validators WHERE address != '${zeroAddr}') as total_staked,
+        (SELECT COALESCE(SUM(total_rewards), 0) FROM validators WHERE address != '${zeroAddr}') as total_rewards_distributed,
+        (SELECT COALESCE(SUM(total_slashed), 0) FROM validators WHERE address != '${zeroAddr}') as total_slashed,
         (SELECT MAX(epoch) FROM epochs) as latest_epoch,
         (SELECT COUNT(*) FROM events) as total_events,
         (SELECT MAX(block_number) FROM events) as latest_indexed_block,
@@ -735,13 +753,17 @@ export class Database {
         (SELECT COUNT(*) FROM delegations) as total_delegations,
         (SELECT COALESCE(SUM(total_deposited - total_withdrawn), 0) FROM delegations) as total_delegated,
         -- Estimated APY based on actual elapsed time (first epoch timestamp to now)
+        -- Only count validators with meaningful stake (> 1e15 wei = 0.001 token) to avoid skewed results
         (SELECT CASE
-          WHEN COALESCE(SUM(v.total_stake), 0) > 0
+          WHEN COALESCE(SUM(v.total_stake), 0) > 1000000000000000
             AND MAX(first_epoch.ts) IS NOT NULL
-            AND EXTRACT(EPOCH FROM NOW() - MAX(first_epoch.ts)) > 0
-          THEN ROUND(
-            COALESCE(SUM(v.total_rewards), 0) / GREATEST(SUM(v.total_stake), 1) *
-            (365.25 * 86400.0 / EXTRACT(EPOCH FROM NOW() - MAX(first_epoch.ts))) * 100, 2
+            AND EXTRACT(EPOCH FROM NOW() - MAX(first_epoch.ts)) > 3600
+          THEN LEAST(
+            ROUND(
+              COALESCE(SUM(v.total_rewards), 0) / GREATEST(SUM(v.total_stake), 1) *
+              (365.25 * 86400.0 / EXTRACT(EPOCH FROM NOW() - MAX(first_epoch.ts))) * 100, 2
+            ),
+            9999.99
           )
           ELSE 0
         END
@@ -749,6 +771,7 @@ export class Database {
         CROSS JOIN (
           SELECT MIN(advanced_at_timestamp) as ts FROM epochs WHERE advanced_at_timestamp IS NOT NULL
         ) first_epoch
+        WHERE v.address != '${zeroAddr}' AND v.total_stake > 1000000000000000
         ) as estimated_apy
     `);
     return result.rows[0];
@@ -781,13 +804,13 @@ export class Database {
         total_staked, epoch, events_in_window,
         rpc_latency_avg_ms, rpc_latency_p95_ms
       ) SELECT
-        NOW(), $1,
-        (SELECT COUNT(*) FROM validators WHERE status = 'active'),
-        (SELECT COUNT(*) FROM validators WHERE status = 'banned'),
-        (SELECT COUNT(*) FROM validators WHERE status = 'quarantined'),
-        (SELECT COALESCE(SUM(total_stake), 0) FROM validators),
+        NOW(), $1::bigint,
+        (SELECT COUNT(*) FROM validators WHERE status = 'active' AND address != '${ZERO_ADDRESS}'),
+        (SELECT COUNT(*) FROM validators WHERE status = 'banned' AND address != '${ZERO_ADDRESS}'),
+        (SELECT COUNT(*) FROM validators WHERE status = 'quarantined' AND address != '${ZERO_ADDRESS}'),
+        (SELECT COALESCE(SUM(total_stake), 0) FROM validators WHERE address != '${ZERO_ADDRESS}'),
         (SELECT MAX(epoch) FROM epochs),
-        (SELECT COUNT(*) FROM events WHERE block_number > $1 - 1000),
+        (SELECT COUNT(*) FROM events WHERE block_number > $1::bigint - 1000),
         $2, $3`,
       [
         data.blockNumber.toString(),
@@ -821,7 +844,7 @@ export class Database {
            THEN e1.advanced_at_block - e2.advanced_at_block
            ELSE NULL
          END as block_duration,
-         (SELECT COUNT(*) FROM events
+         (SELECT COUNT(DISTINCT LOWER(args->>'validator')) FROM events
           WHERE event_name = 'ValidatorPrime'
           AND (args->>'epoch')::bigint = e1.epoch
          ) as prime_count,
@@ -847,22 +870,22 @@ export class Database {
          e.finalized_at_block,
          COALESCE(p.primed_count, 0) as primed_validators,
          COALESCE(e.validator_count,
-           (SELECT COUNT(*) FROM validators WHERE status = 'active')
+           (SELECT COUNT(*) FROM validators WHERE status = 'active' AND address != '${ZERO_ADDRESS}')
          ) as total_validators,
          CASE WHEN COALESCE(e.validator_count,
-           (SELECT COUNT(*) FROM validators WHERE status = 'active')
+           (SELECT COUNT(*) FROM validators WHERE status = 'active' AND address != '${ZERO_ADDRESS}')
          ) > 0
            THEN ROUND(
              COALESCE(p.primed_count, 0)::numeric /
              COALESCE(e.validator_count,
-               (SELECT COUNT(*) FROM validators WHERE status = 'active')
+               (SELECT COUNT(*) FROM validators WHERE status = 'active' AND address != '${ZERO_ADDRESS}')
              ) * 100, 2
            )
            ELSE 0
          END as uptime_percentage
        FROM epochs e
        LEFT JOIN (
-         SELECT (args->>'epoch')::bigint as epoch, COUNT(DISTINCT args->>'validator') as primed_count
+         SELECT (args->>'epoch')::bigint as epoch, COUNT(DISTINCT LOWER(args->>'validator')) as primed_count
          FROM events
          WHERE event_name = 'ValidatorPrime'
          GROUP BY (args->>'epoch')::bigint
@@ -909,7 +932,7 @@ export class Database {
          CASE WHEN ev.id IS NOT NULL THEN true ELSE false END as primed
        FROM epochs e
        LEFT JOIN events ev ON ev.event_name = 'ValidatorPrime'
-         AND ev.args->>'validator' = $1
+         AND LOWER(ev.args->>'validator') = $1
          AND (ev.args->>'epoch')::bigint = e.epoch
        ORDER BY e.epoch DESC
        LIMIT $2`,
@@ -925,16 +948,16 @@ export class Database {
   async getDashboardSummary(rpcLatency?: { avgMs: number; p95Ms: number }) {
     const result = await this.pool.query(`
       SELECT
-        (SELECT COUNT(*) FROM validators) as total_validators,
-        (SELECT COUNT(*) FROM validators WHERE status = 'active') as active_validators,
-        (SELECT COUNT(*) FROM validators WHERE status = 'banned') as banned_validators,
-        (SELECT COUNT(*) FROM validators WHERE status = 'quarantined') as quarantined_validators,
+        (SELECT COUNT(*) FROM validators WHERE address != '${ZERO_ADDRESS}') as total_validators,
+        (SELECT COUNT(*) FROM validators WHERE status = 'active' AND address != '${ZERO_ADDRESS}') as active_validators,
+        (SELECT COUNT(*) FROM validators WHERE status = 'banned' AND address != '${ZERO_ADDRESS}') as banned_validators,
+        (SELECT COUNT(*) FROM validators WHERE status = 'quarantined' AND address != '${ZERO_ADDRESS}') as quarantined_validators,
         (SELECT MAX(epoch) FROM epochs) as latest_epoch,
-        (SELECT COALESCE(SUM(total_stake), 0) FROM validators) as total_staked,
+        (SELECT COALESCE(SUM(total_stake), 0) FROM validators WHERE address != '${ZERO_ADDRESS}') as total_staked,
         (SELECT CASE WHEN SUM(prime_count + slash_count) > 0
           THEN ROUND(SUM(prime_count)::numeric / SUM(prime_count + slash_count) * 100, 2)
           ELSE 100
-        END FROM validators WHERE status = 'active') as avg_participation,
+        END FROM validators WHERE status = 'active' AND address != '${ZERO_ADDRESS}') as avg_participation,
         (SELECT COUNT(*) FROM events WHERE block_timestamp > NOW() - INTERVAL '24 hours') as event_throughput_24h
     `);
     const row = result.rows[0];
@@ -943,18 +966,18 @@ export class Database {
     const uptimeResult = await this.pool.query(`
       SELECT COALESCE(AVG(
         CASE WHEN COALESCE(e.validator_count,
-          (SELECT COUNT(*) FROM validators WHERE status = 'active')
+          (SELECT COUNT(*) FROM validators WHERE status = 'active' AND address != '${ZERO_ADDRESS}')
         ) > 0
           THEN COALESCE(p.primed_count, 0)::numeric /
             COALESCE(e.validator_count,
-              (SELECT COUNT(*) FROM validators WHERE status = 'active')
+              (SELECT COUNT(*) FROM validators WHERE status = 'active' AND address != '${ZERO_ADDRESS}')
             ) * 100
           ELSE 0
         END
       ), 0) as network_uptime
       FROM epochs e
       LEFT JOIN (
-        SELECT (args->>'epoch')::bigint as epoch, COUNT(DISTINCT args->>'validator') as primed_count
+        SELECT (args->>'epoch')::bigint as epoch, COUNT(DISTINCT LOWER(args->>'validator')) as primed_count
         FROM events WHERE event_name = 'ValidatorPrime'
         GROUP BY (args->>'epoch')::bigint
       ) p ON p.epoch = e.epoch
@@ -1004,6 +1027,7 @@ export class Database {
            COUNT(*) FILTER (WHERE total_deposited > total_withdrawn) as delegator_count
          FROM delegations GROUP BY validator_address
        ) d ON d.validator_address = v.address
+       WHERE v.address != '${ZERO_ADDRESS}'
        ORDER BY ${orderBy}
        LIMIT $1`,
       [limit]
@@ -1025,12 +1049,12 @@ export class Database {
        FROM epochs e
        CROSS JOIN (SELECT status FROM validators WHERE address = $1) v
        LEFT JOIN events prime_ev ON prime_ev.event_name = 'ValidatorPrime'
-         AND prime_ev.args->>'validator' = $1
+         AND LOWER(prime_ev.args->>'validator') = $1
          AND (prime_ev.args->>'epoch')::bigint = e.epoch
        LEFT JOIN (
          SELECT (args->>'epoch')::bigint as epoch, COUNT(*) as cnt
          FROM events
-         WHERE category = 'slashing' AND args->>'validator' = $1
+         WHERE category = 'slashing' AND LOWER(args->>'validator') = $1
          GROUP BY (args->>'epoch')::bigint
        ) slash_ev ON slash_ev.epoch = e.epoch
        ORDER BY e.epoch DESC
@@ -1076,7 +1100,7 @@ export class Database {
            - COALESCE((args->>'feePenalties')::numeric, 0) as net_rewards
        FROM events
        WHERE event_name = 'ValidatorPrime'
-         AND args->>'validator' = $1
+         AND LOWER(args->>'validator') = $1
        ORDER BY block_number DESC
        LIMIT $2`,
       [address.toLowerCase(), limit]
@@ -1111,7 +1135,7 @@ export class Database {
            ELSE 'active'
          END as resulting_status
        FROM events e
-       WHERE e.args->>'validator' = $1
+       WHERE LOWER(e.args->>'validator') = $1
          AND (e.category = 'slashing' OR e.category = 'quarantine')
        ORDER BY e.block_number DESC
        LIMIT $2`,
@@ -1240,18 +1264,18 @@ export class Database {
         COALESCE(u.uptime_pct, 100) as uptime_percentage,
         -- latest status-changing event timestamp
         (SELECT block_timestamp FROM events
-         WHERE args->>'validator' = $1
+         WHERE LOWER(args->>'validator') = $1
            AND event_name IN ('ValidatorJoin','ValidatorExit','ValidatorBannedIdleness','ValidatorBannedDeterministic','ValidatorQuarantined','ValidatorQuarantineRemoved','ValidatorBanRemoved','AllValidatorBansRemoved')
          ORDER BY block_number DESC LIMIT 1
         ) as latest_status_change_at,
         -- last event timestamp
         (SELECT block_timestamp FROM events
-         WHERE args->>'validator' = $1
+         WHERE LOWER(args->>'validator') = $1
          ORDER BY block_number DESC LIMIT 1
         ) as last_event_at,
         -- recent slashes in last 30 days
         (SELECT COUNT(*) FROM events
-         WHERE args->>'validator' = $1
+         WHERE LOWER(args->>'validator') = $1
            AND category = 'slashing'
            AND block_timestamp > NOW() - INTERVAL '30 days'
         ) as recent_slash_count_30d,
@@ -1262,7 +1286,7 @@ export class Database {
           ) ELSE 100 END
          FROM (SELECT epoch FROM epochs ORDER BY epoch DESC LIMIT 30) recent_e
          LEFT JOIN events prime_ev ON prime_ev.event_name = 'ValidatorPrime'
-           AND prime_ev.args->>'validator' = $1
+           AND LOWER(prime_ev.args->>'validator') = $1
            AND (prime_ev.args->>'epoch')::bigint = recent_e.epoch
         ) as recent_prime_rate_30_epochs
        FROM validators v
@@ -1314,7 +1338,7 @@ export class Database {
     sort?: string;
     order?: "asc" | "desc";
   }) {
-    const conditions: string[] = [];
+    const conditions: string[] = [`v.address != '${ZERO_ADDRESS}'`];
     const values: unknown[] = [];
     let paramIndex = 1;
 
@@ -1323,7 +1347,7 @@ export class Database {
       values.push(params.status);
     }
 
-    const where = conditions.length > 0 ? `WHERE ${conditions.join(" AND ")}` : "";
+    const where = `WHERE ${conditions.join(" AND ")}`;
     const limit = params.limit || 100;
     const offset = params.offset || 0;
 
@@ -1399,7 +1423,7 @@ export class Database {
       values.push(params.category);
     }
     if (params.validator) {
-      conditions.push(`args->>'validator' = $${paramIndex++}`);
+      conditions.push(`LOWER(args->>'validator') = $${paramIndex++}`);
       values.push(params.validator.toLowerCase());
     }
     if (params.fromBlock !== undefined) {
