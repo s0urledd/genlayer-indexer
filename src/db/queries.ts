@@ -379,6 +379,10 @@ export class Database {
     voteRevealed: boolean;
     blockNumber: bigint;
   }>) {
+    // Ensure validator exists in validators table (consensus participants may not be in staking)
+    await this.upsertValidator(validator, {
+      lastSeenBlock: data.blockNumber,
+    });
     await this.pool.query(
       `INSERT INTO validator_tx_participation (tx_id, validator, role, vote_type, vote_committed, vote_revealed, block_number, updated_at)
        VALUES ($1, $2, COALESCE($3, 'validator'), $4, COALESCE($5, false), COALESCE($6, false), $7, NOW())
