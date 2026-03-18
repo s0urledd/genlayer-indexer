@@ -439,10 +439,18 @@ export class Indexer {
       case "ValidatorPrime": {
         const validator = (args.validator as string).toLowerCase();
         const epoch = BigInt(args.epoch as string);
-        const validatorRewards = args.validatorRewards as string;
+        const validatorRewards = (args.validatorRewards as string) || "0";
+        const delegatorRewards = (args.delegatorRewards as string) || "0";
+        const feeRewards = (args.feeRewards as string) || "0";
+        const feePenalties = (args.feePenalties as string) || "0";
 
-        // Atomic increment — no read-modify-write race
-        await this.db.incrementValidatorPrime(validator, validatorRewards, epoch);
+        await this.db.incrementValidatorPrime(validator, {
+          validatorRewards,
+          delegatorRewards,
+          feeRewards,
+          feePenalties,
+          epoch,
+        });
         await this.db.upsertValidator(validator, {
           lastSeenBlock: blockNumber,
         });
@@ -451,10 +459,10 @@ export class Indexer {
 
       case "ValidatorSlash": {
         const validator = (args.validator as string).toLowerCase();
-        const validatorSlashing = args.validatorSlashing as string;
+        const validatorSlashing = (args.validatorSlashing as string) || "0";
+        const delegatorSlashing = (args.delegatorSlashing as string) || "0";
 
-        // Atomic increment — no read-modify-write race
-        await this.db.incrementValidatorSlash(validator, validatorSlashing);
+        await this.db.incrementValidatorSlash(validator, validatorSlashing, delegatorSlashing);
         await this.db.upsertValidator(validator, {
           lastSeenBlock: blockNumber,
         });
@@ -616,13 +624,13 @@ export class Indexer {
         const validator = args.validator as string;
         const voteTypeNum = parseInt(args.voteType as string);
         const voteType = VOTE_TYPES[voteTypeNum] || `UNKNOWN_${voteTypeNum}`;
+        const voteResult = parseInt(args.result as string);
         await this.db.upsertValidatorTxParticipation(txId, validator, {
           voteRevealed: true,
           voteType,
+          voteResult: isNaN(voteResult) ? undefined : voteResult,
           blockNumber,
         });
-        // Individual vote types are stored per-validator in participation table.
-        // Don't overwrite consensus_tx.vote_type — it would only keep the last voter's type.
         break;
       }
 
@@ -685,7 +693,19 @@ export class Indexer {
 
       case "AppealStarted": {
         const txId = args.txId as string;
-        await this.db.incrementConsensusTxAppeal(txId);
+        const appellant = args.appellant as string;
+        const bond = (args.bond as string) || "0";
+        const appealValidators = args.validators as string[];
+        await this.db.incrementConsensusTxAppeal(txId, appellant, bond);
+        // Register appeal validators as participants
+        if (appealValidators) {
+          for (const v of appealValidators) {
+            await this.db.upsertValidatorTxParticipation(txId, v, {
+              role: "appeal_validator",
+              blockNumber,
+            });
+          }
+        }
         break;
       }
 
@@ -778,7 +798,7 @@ export class Indexer {
           }
         }
 
-        await this.db.incrementValidatorSlash(validator, slashAmount);
+        await this.db.incrementValidatorSlash(validator, slashAmount, "0");
         await this.db.upsertValidator(validator, {
           lastSeenBlock: blockNumber,
         });

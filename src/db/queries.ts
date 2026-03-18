@@ -232,30 +232,40 @@ export class Database {
 
   // Atomically increment prime_count and add rewards (for ValidatorPrime)
   // Uses upsert so primes arriving before ValidatorJoin are not lost
-  async incrementValidatorPrime(address: string, rewards: string, epoch: bigint) {
+  async incrementValidatorPrime(address: string, data: {
+    validatorRewards: string;
+    delegatorRewards: string;
+    feeRewards: string;
+    feePenalties: string;
+    epoch: bigint;
+  }) {
     await this.pool.query(
-      `INSERT INTO validators (address, prime_count, total_rewards, last_prime_epoch, updated_at)
-       VALUES ($1, 1, $2, $3, NOW())
+      `INSERT INTO validators (address, prime_count, total_rewards, total_delegator_rewards, total_fee_rewards, total_fee_penalties, last_prime_epoch, updated_at)
+       VALUES ($1, 1, $2::numeric, $3::numeric, $4::numeric, $5::numeric, $6, NOW())
        ON CONFLICT (address) DO UPDATE SET
         prime_count = validators.prime_count + 1,
-        total_rewards = validators.total_rewards + $2,
-        last_prime_epoch = $3,
+        total_rewards = validators.total_rewards + $2::numeric,
+        total_delegator_rewards = validators.total_delegator_rewards + $3::numeric,
+        total_fee_rewards = validators.total_fee_rewards + $4::numeric,
+        total_fee_penalties = validators.total_fee_penalties + $5::numeric,
+        last_prime_epoch = $6,
         updated_at = NOW()`,
-      [address.toLowerCase(), rewards, epoch.toString()]
+      [address.toLowerCase(), data.validatorRewards, data.delegatorRewards, data.feeRewards, data.feePenalties, data.epoch.toString()]
     );
   }
 
   // Atomically increment slash_count and add slashed amount (for ValidatorSlash/SlashedFromIdleness)
   // Uses upsert so slashes arriving before ValidatorJoin are not lost
-  async incrementValidatorSlash(address: string, slashedAmount: string) {
+  async incrementValidatorSlash(address: string, validatorSlashing: string, delegatorSlashing: string) {
     await this.pool.query(
-      `INSERT INTO validators (address, slash_count, total_slashed, updated_at)
-       VALUES ($1, 1, $2, NOW())
+      `INSERT INTO validators (address, slash_count, total_slashed, total_delegator_slashed, updated_at)
+       VALUES ($1, 1, $2::numeric, $3::numeric, NOW())
        ON CONFLICT (address) DO UPDATE SET
         slash_count = validators.slash_count + 1,
-        total_slashed = validators.total_slashed + $2,
+        total_slashed = validators.total_slashed + $2::numeric,
+        total_delegator_slashed = validators.total_delegator_slashed + $3::numeric,
         updated_at = NOW()`,
-      [address.toLowerCase(), slashedAmount]
+      [address.toLowerCase(), validatorSlashing, delegatorSlashing]
     );
   }
 
@@ -365,16 +375,22 @@ export class Database {
     );
   }
 
-  async incrementConsensusTxAppeal(txId: string) {
+  async incrementConsensusTxAppeal(txId: string, appellant?: string, bond?: string) {
     await this.pool.query(
-      `UPDATE consensus_transactions SET appeal_count = appeal_count + 1, updated_at = NOW() WHERE tx_id = $1`,
-      [txId]
+      `UPDATE consensus_transactions SET
+        appeal_count = appeal_count + 1,
+        appellant = COALESCE($2, consensus_transactions.appellant),
+        appeal_bond = COALESCE($3::numeric, consensus_transactions.appeal_bond),
+        updated_at = NOW()
+       WHERE tx_id = $1`,
+      [txId, appellant?.toLowerCase() || null, bond || null]
     );
   }
 
   async upsertValidatorTxParticipation(txId: string, validator: string, data: Partial<{
     role: string;
     voteType: string;
+    voteResult: number;
     voteCommitted: boolean;
     voteRevealed: boolean;
     blockNumber: bigint;
@@ -384,20 +400,22 @@ export class Database {
       lastSeenBlock: data.blockNumber,
     });
     await this.pool.query(
-      `INSERT INTO validator_tx_participation (tx_id, validator, role, vote_type, vote_committed, vote_revealed, block_number, updated_at)
-       VALUES ($1, $2, COALESCE($3, 'validator'), $4, COALESCE($5, false), COALESCE($6, false), $7, NOW())
+      `INSERT INTO validator_tx_participation (tx_id, validator, role, vote_type, vote_result, vote_committed, vote_revealed, block_number, updated_at)
+       VALUES ($1, $2, COALESCE($3, 'validator'), $4, $5, COALESCE($6, false), COALESCE($7, false), $8, NOW())
        ON CONFLICT (tx_id, validator) DO UPDATE SET
          role = COALESCE($3, validator_tx_participation.role),
          vote_type = COALESCE($4, validator_tx_participation.vote_type),
-         vote_committed = COALESCE($5, validator_tx_participation.vote_committed),
-         vote_revealed = COALESCE($6, validator_tx_participation.vote_revealed),
-         block_number = COALESCE($7, validator_tx_participation.block_number),
+         vote_result = COALESCE($5, validator_tx_participation.vote_result),
+         vote_committed = COALESCE($6, validator_tx_participation.vote_committed),
+         vote_revealed = COALESCE($7, validator_tx_participation.vote_revealed),
+         block_number = COALESCE($8, validator_tx_participation.block_number),
          updated_at = NOW()`,
       [
         txId,
         validator.toLowerCase(),
         data.role || null,
         data.voteType || null,
+        data.voteResult ?? null,
         data.voteCommitted ?? null,
         data.voteRevealed ?? null,
         data.blockNumber?.toString() || null,
