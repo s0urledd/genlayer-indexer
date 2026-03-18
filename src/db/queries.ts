@@ -193,10 +193,14 @@ export class Database {
     finalizedAtTimestamp: Date;
     inflationAmount: string;
     validatorCount: number;
+    totalWeight: string;
+    totalStakeDeposited: string;
+    totalStakeWithdrawn: string;
+    totalSlashed: string;
   }>) {
     await this.pool.query(
-      `INSERT INTO epochs (epoch, advanced_at_block, finalized_at_block, advanced_at_timestamp, finalized_at_timestamp, inflation_amount, validator_count, updated_at)
-       VALUES ($1, $2, $3, $4, $5, $6, $7, NOW())
+      `INSERT INTO epochs (epoch, advanced_at_block, finalized_at_block, advanced_at_timestamp, finalized_at_timestamp, inflation_amount, validator_count, total_weight, total_stake_deposited, total_stake_withdrawn, total_slashed, updated_at)
+       VALUES ($1, $2, $3, $4, $5, $6, $7, $8::numeric, $9::numeric, $10::numeric, $11::numeric, NOW())
        ON CONFLICT (epoch) DO UPDATE SET
          advanced_at_block = COALESCE($2, epochs.advanced_at_block),
          finalized_at_block = COALESCE($3, epochs.finalized_at_block),
@@ -204,6 +208,10 @@ export class Database {
          finalized_at_timestamp = COALESCE($5, epochs.finalized_at_timestamp),
          inflation_amount = COALESCE($6, epochs.inflation_amount),
          validator_count = COALESCE($7, epochs.validator_count),
+         total_weight = COALESCE($8::numeric, epochs.total_weight),
+         total_stake_deposited = COALESCE($9::numeric, epochs.total_stake_deposited),
+         total_stake_withdrawn = COALESCE($10::numeric, epochs.total_stake_withdrawn),
+         total_slashed = COALESCE($11::numeric, epochs.total_slashed),
          updated_at = NOW()`,
       [
         epoch.toString(),
@@ -213,6 +221,10 @@ export class Database {
         data.finalizedAtTimestamp || null,
         data.inflationAmount || null,
         data.validatorCount ?? null,
+        data.totalWeight || null,
+        data.totalStakeDeposited || null,
+        data.totalStakeWithdrawn || null,
+        data.totalSlashed || null,
       ]
     );
   }
@@ -279,6 +291,36 @@ export class Database {
         total_stake = GREATEST(validators.total_stake - $2, 0),
         updated_at = NOW()`,
       [address.toLowerCase(), amount]
+    );
+  }
+
+  async updateValidatorWeight(address: string, weight: string) {
+    await this.pool.query(
+      `UPDATE validators SET selection_weight = $2::numeric, updated_at = NOW() WHERE address = $1`,
+      [address.toLowerCase(), weight]
+    );
+  }
+
+  async updateValidatorLiveData(address: string, data: {
+    totalStake: string;
+    totalShares: string;
+    delegatedStake: string;
+  }) {
+    await this.pool.query(
+      `UPDATE validators SET
+        total_stake = $2::numeric,
+        total_shares = $3::numeric,
+        delegated_stake = $4::numeric,
+        updated_at = NOW()
+       WHERE address = $1`,
+      [address.toLowerCase(), data.totalStake, data.totalShares, data.delegatedStake]
+    );
+  }
+
+  async updateValidatorDelegatorCount(address: string, count: number) {
+    await this.pool.query(
+      `UPDATE validators SET delegator_count = $2, updated_at = NOW() WHERE address = $1`,
+      [address.toLowerCase(), count]
     );
   }
 
