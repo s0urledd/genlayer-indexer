@@ -157,7 +157,7 @@ export class Database {
   }>) {
     await this.pool.query(
       `INSERT INTO validators (address, operator, status, total_stake, total_rewards, total_slashed, prime_count, slash_count, last_prime_epoch, last_seen_block, joined_at_block, updated_at)
-       VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, NOW())
+       VALUES ($1, $2, COALESCE($3, 'active'), $4, $5, $6, $7, $8, $9, $10, $11, NOW())
        ON CONFLICT (address) DO UPDATE SET
          operator = COALESCE($2, validators.operator),
          status = COALESCE($3, validators.status),
@@ -173,7 +173,7 @@ export class Database {
       [
         address.toLowerCase(),
         data.operator?.toLowerCase() || null,
-        data.status || null,
+        data.status || 'active',
         data.totalStake || null,
         data.totalRewards || null,
         data.totalSlashed || null,
@@ -323,7 +323,7 @@ export class Database {
   }>) {
     await this.pool.query(
       `INSERT INTO consensus_transactions (tx_id, recipient, activator, leader, status, vote_type, result_type, rotation_count, appeal_count, validators, created_at_block, created_at_timestamp, accepted_at_block, finalized_at_block, updated_at)
-       VALUES ($1, $2, $3, $4, $5, $6, $7, COALESCE($8, 0), COALESCE($9, 0), $10, $11, $12, $13, $14, NOW())
+       VALUES ($1, $2, $3, $4, COALESCE($5, 'pending'), $6, $7, COALESCE($8, 0), COALESCE($9, 0), $10, $11, $12, $13, $14, NOW())
        ON CONFLICT (tx_id) DO UPDATE SET
          recipient = COALESCE($2, consensus_transactions.recipient),
          activator = COALESCE($3, consensus_transactions.activator),
@@ -344,7 +344,7 @@ export class Database {
         data.recipient?.toLowerCase() || null,
         data.activator?.toLowerCase() || null,
         data.leader?.toLowerCase() || null,
-        data.status || null,
+        data.status || 'pending',
         data.voteType || null,
         data.resultType || null,
         data.rotationCount ?? null,
