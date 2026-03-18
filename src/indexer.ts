@@ -32,9 +32,12 @@ export class Indexer {
   private rpcFetchSamples: number[] = [];
   private readonly LATENCY_WINDOW = 100; // keep last 100 samples
 
-  // Metrics snapshot interval (every 60 batches ≈ 5 minutes at 5s poll)
+  // Metrics snapshot interval (every 60 batches)
   private batchCount = 0;
   private readonly METRICS_INTERVAL = 60;
+
+  // Validator status sync interval (every 30 batches ≈ 30s at 1s poll)
+  private readonly VALIDATOR_SYNC_INTERVAL = 30;
 
   constructor(db: Database) {
     this.client = createPublicClient({
@@ -118,6 +121,15 @@ export class Indexer {
       }
     }
 
+    // Sync validator statuses from on-chain state periodically
+    if (this.batchCount % this.VALIDATOR_SYNC_INTERVAL === 0) {
+      try {
+        await this.syncValidatorStatuses();
+      } catch (err) {
+        console.error("Failed to sync validator statuses:", err);
+      }
+    }
+
     // Evict old cache entries to prevent memory bloat
     if (this.blockTimestampCache.size > this.TIMESTAMP_CACHE_MAX) {
       const entries = [...this.blockTimestampCache.entries()]
@@ -125,6 +137,86 @@ export class Indexer {
       const toRemove = entries.slice(0, entries.length - this.TIMESTAMP_CACHE_MAX / 2);
       for (const [key] of toRemove) {
         this.blockTimestampCache.delete(key);
+      }
+    }
+  }
+
+  /**
+   * Sync validator statuses directly from staking contract state.
+   * This catches any status changes that might have been missed by events
+   * and ensures banned/quarantined/active statuses are always accurate.
+   */
+  private async syncValidatorStatuses() {
+    const stakingAddr = config.stakingContract;
+
+    // Fetch active validators
+    const activeResult = await this.client.readContract({
+      address: stakingAddr,
+      abi: [{
+        type: "function", name: "activeValidators",
+        inputs: [], outputs: [{ type: "address[]", name: "" }],
+        stateMutability: "view",
+      }] as const,
+      functionName: "activeValidators",
+    });
+    const activeValidators = new Set(
+      (activeResult as string[]).map((a: string) => a.toLowerCase())
+    );
+
+    // Fetch quarantined validators
+    const quarantineResult = await this.client.readContract({
+      address: stakingAddr,
+      abi: [{
+        type: "function", name: "getValidatorQuarantineList",
+        inputs: [], outputs: [{ type: "address[]", name: "" }],
+        stateMutability: "view",
+      }] as const,
+      functionName: "getValidatorQuarantineList",
+    });
+    const quarantinedValidators = new Set(
+      (quarantineResult as string[]).map((a: string) => a.toLowerCase())
+    );
+
+    // Fetch banned validators (paginated, get first 1000)
+    let bannedValidators = new Set<string>();
+    try {
+      const bannedResult = await this.client.readContract({
+        address: stakingAddr,
+        abi: [{
+          type: "function", name: "getAllBannedValidators",
+          inputs: [
+            { type: "uint256", name: "_startIndex" },
+            { type: "uint256", name: "_size" },
+          ],
+          outputs: [{ type: "tuple[]", name: "validatorList", components: [
+            { type: "address", name: "validator" },
+            { type: "uint256", name: "bannedAt" },
+            { type: "uint256", name: "bannedUntil" },
+          ]}],
+          stateMutability: "view",
+        }] as const,
+        functionName: "getAllBannedValidators",
+        args: [0n, 1000n],
+      });
+      bannedValidators = new Set(
+        (bannedResult as unknown as Array<{ validator: string }>).map(b => b.validator.toLowerCase())
+      );
+    } catch {
+      // getAllBannedValidators may not be available on all versions
+    }
+
+    // Update validator statuses in DB
+    for (const addr of activeValidators) {
+      await this.db.upsertValidator(addr, { status: "active" });
+    }
+    for (const addr of quarantinedValidators) {
+      if (!activeValidators.has(addr)) {
+        await this.db.upsertValidator(addr, { status: "quarantined" });
+      }
+    }
+    for (const addr of bannedValidators) {
+      if (!activeValidators.has(addr)) {
+        await this.db.upsertValidator(addr, { status: "banned" });
       }
     }
   }

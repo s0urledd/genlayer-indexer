@@ -14,7 +14,7 @@ export const config = {
     process.env.DATABASE_URL ||
     "postgresql://genlayer:genlayer@localhost:5432/genlayer_indexer",
   batchSize: parseInt(process.env.BATCH_SIZE || "1000"),
-  pollIntervalMs: parseInt(process.env.POLL_INTERVAL_MS || "5000"),
+  pollIntervalMs: parseInt(process.env.POLL_INTERVAL_MS || "1000"),
   startBlock: BigInt(process.env.START_BLOCK || "0"),
   apiPort: parseInt(process.env.API_PORT || "3000"),
 };
