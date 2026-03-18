@@ -621,6 +621,7 @@ export const TX_STATUSES: Record<number, string> = {
   11: "VALIDATORS_TIMEOUT",
   12: "LEADER_TIMEOUT",
   13: "READY_TO_FINALIZE",
+  14: "LEADER_REVEALING",
 };
 
 // Combined ABI for use with viem
