@@ -454,10 +454,9 @@ export class Database {
     voteRevealed: boolean;
     blockNumber: bigint;
   }>) {
-    // Ensure validator exists in validators table (consensus participants may not be in staking)
-    await this.upsertValidator(validator, {
-      lastSeenBlock: data.blockNumber,
-    });
+    // Do NOT create validator records from consensus participation.
+    // Only staking events (ValidatorJoin, ValidatorDeposit, etc.) should create validators.
+    // Consensus participants are tracked in validator_tx_participation only.
     await this.pool.query(
       `INSERT INTO validator_tx_participation (tx_id, validator, role, vote_type, vote_result, vote_committed, vote_revealed, block_number, updated_at)
        VALUES ($1, $2, COALESCE($3, 'validator'), $4, $5, COALESCE($6, false), COALESCE($7, false), $8, NOW())
@@ -892,6 +891,8 @@ export class Database {
          GROUP BY (args->>'epoch')::bigint
        ) p ON p.epoch = e.epoch
        WHERE e.advanced_at_block IS NOT NULL
+         AND e.epoch > 1
+         AND e.epoch < (SELECT MAX(epoch) FROM epochs WHERE advanced_at_block IS NOT NULL)
        ORDER BY e.epoch DESC
        LIMIT $1`,
       [epochCount]
@@ -977,7 +978,11 @@ export class Database {
           ELSE 0
         END
       ), 0) as network_uptime
-      FROM (SELECT * FROM epochs WHERE advanced_at_block IS NOT NULL ORDER BY epoch DESC LIMIT 30) e
+      FROM (SELECT * FROM epochs
+            WHERE advanced_at_block IS NOT NULL
+              AND epoch > 1
+              AND epoch < (SELECT MAX(epoch) FROM epochs WHERE advanced_at_block IS NOT NULL)
+            ORDER BY epoch DESC LIMIT 30) e
       LEFT JOIN (
         SELECT (args->>'epoch')::bigint as epoch,
           COUNT(DISTINCT LOWER(args->>'validator')) FILTER (WHERE LOWER(args->>'validator') != '${ZERO_ADDRESS}') as primed_count
