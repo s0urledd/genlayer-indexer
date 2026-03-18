@@ -157,7 +157,7 @@ export class Database {
   }>) {
     await this.pool.query(
       `INSERT INTO validators (address, operator, status, total_stake, total_rewards, total_slashed, prime_count, slash_count, last_prime_epoch, last_seen_block, joined_at_block, updated_at)
-       VALUES ($1, $2, COALESCE($3, 'active'), $4, $5, $6, $7, $8, $9, $10, $11, NOW())
+       VALUES ($1, $2, COALESCE($3, 'active'), COALESCE($4, 0), COALESCE($5, 0), COALESCE($6, 0), COALESCE($7, 0), COALESCE($8, 0), $9, $10, $11, NOW())
        ON CONFLICT (address) DO UPDATE SET
          operator = COALESCE($2, validators.operator),
          status = COALESCE($3, validators.status),
