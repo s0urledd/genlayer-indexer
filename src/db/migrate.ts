@@ -31,7 +31,11 @@ CREATE TABLE IF NOT EXISTS validators (
   status TEXT NOT NULL DEFAULT 'active',
   total_stake NUMERIC NOT NULL DEFAULT 0,
   total_rewards NUMERIC NOT NULL DEFAULT 0,
+  total_delegator_rewards NUMERIC NOT NULL DEFAULT 0,
+  total_fee_rewards NUMERIC NOT NULL DEFAULT 0,
+  total_fee_penalties NUMERIC NOT NULL DEFAULT 0,
   total_slashed NUMERIC NOT NULL DEFAULT 0,
+  total_delegator_slashed NUMERIC NOT NULL DEFAULT 0,
   prime_count INTEGER NOT NULL DEFAULT 0,
   slash_count INTEGER NOT NULL DEFAULT 0,
   last_prime_epoch BIGINT,
@@ -89,6 +93,8 @@ CREATE TABLE IF NOT EXISTS consensus_transactions (
   result_type TEXT,
   rotation_count INTEGER NOT NULL DEFAULT 0,
   appeal_count INTEGER NOT NULL DEFAULT 0,
+  appellant TEXT,
+  appeal_bond NUMERIC,
   validators TEXT[] DEFAULT '{}',
   created_at_block BIGINT,
   created_at_timestamp TIMESTAMPTZ,
@@ -104,6 +110,7 @@ CREATE TABLE IF NOT EXISTS validator_tx_participation (
   validator TEXT NOT NULL,
   role TEXT NOT NULL DEFAULT 'validator',
   vote_type TEXT,
+  vote_result INTEGER,
   vote_committed BOOLEAN NOT NULL DEFAULT false,
   vote_revealed BOOLEAN NOT NULL DEFAULT false,
   block_number BIGINT,
@@ -117,10 +124,17 @@ CREATE INDEX IF NOT EXISTS idx_consensus_tx_recipient ON consensus_transactions(
 CREATE INDEX IF NOT EXISTS idx_vtx_validator ON validator_tx_participation(validator);
 CREATE INDEX IF NOT EXISTS idx_vtx_txid ON validator_tx_participation(tx_id);
 
--- Add timestamp columns to epochs if missing (for existing databases)
+-- Add columns for existing databases
 DO $$ BEGIN
   ALTER TABLE epochs ADD COLUMN IF NOT EXISTS advanced_at_timestamp TIMESTAMPTZ;
   ALTER TABLE epochs ADD COLUMN IF NOT EXISTS finalized_at_timestamp TIMESTAMPTZ;
+  ALTER TABLE validators ADD COLUMN IF NOT EXISTS total_delegator_rewards NUMERIC NOT NULL DEFAULT 0;
+  ALTER TABLE validators ADD COLUMN IF NOT EXISTS total_fee_rewards NUMERIC NOT NULL DEFAULT 0;
+  ALTER TABLE validators ADD COLUMN IF NOT EXISTS total_fee_penalties NUMERIC NOT NULL DEFAULT 0;
+  ALTER TABLE validators ADD COLUMN IF NOT EXISTS total_delegator_slashed NUMERIC NOT NULL DEFAULT 0;
+  ALTER TABLE validator_tx_participation ADD COLUMN IF NOT EXISTS vote_result INTEGER;
+  ALTER TABLE consensus_transactions ADD COLUMN IF NOT EXISTS appellant TEXT;
+  ALTER TABLE consensus_transactions ADD COLUMN IF NOT EXISTS appeal_bond NUMERIC;
 EXCEPTION WHEN others THEN NULL;
 END $$;
 
