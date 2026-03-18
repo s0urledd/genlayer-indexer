@@ -205,9 +205,30 @@ export class Indexer {
       // getAllBannedValidators may not be available on all versions
     }
 
-    // Update validator statuses in DB
-    for (const addr of activeValidators) {
+    // Fetch active weights (parallel with status updates)
+    let activeWeights: bigint[] = [];
+    try {
+      const weightsResult = await this.client.readContract({
+        address: stakingAddr,
+        abi: [{
+          type: "function", name: "activeWeights",
+          inputs: [], outputs: [{ type: "uint256[]", name: "" }],
+          stateMutability: "view",
+        }] as const,
+        functionName: "activeWeights",
+      });
+      activeWeights = weightsResult as bigint[];
+    } catch {
+      // activeWeights may not be available
+    }
+
+    // Update validator statuses and weights in DB
+    const activeList = [...activeValidators];
+    for (let i = 0; i < activeList.length; i++) {
+      const addr = activeList[i];
+      const weight = activeWeights[i] ? activeWeights[i].toString() : "0";
       await this.db.upsertValidator(addr, { status: "active" });
+      await this.db.updateValidatorWeight(addr, weight);
     }
     for (const addr of quarantinedValidators) {
       if (!activeValidators.has(addr)) {
@@ -218,6 +239,125 @@ export class Indexer {
       if (!activeValidators.has(addr)) {
         await this.db.upsertValidator(addr, { status: "banned" });
       }
+    }
+
+    // Sync live stake data from validatorView() for each active validator
+    for (const addr of activeList) {
+      try {
+        const viewResult = await this.client.readContract({
+          address: stakingAddr,
+          abi: [{
+            type: "function", name: "validatorView",
+            inputs: [{ type: "address", name: "_validator" }],
+            outputs: [{ type: "tuple", name: "", components: [
+              { type: "uint256", name: "stake" },
+              { type: "uint256", name: "shares" },
+              { type: "uint256", name: "delegatedStake" },
+              { type: "uint256", name: "delegatedShares" },
+              { type: "uint256", name: "totalStake" },
+              { type: "uint256", name: "totalShares" },
+              { type: "uint256", name: "deposited" },
+              { type: "uint256", name: "withdrawn" },
+            ]}],
+            stateMutability: "view",
+          }] as const,
+          functionName: "validatorView",
+          args: [addr as `0x${string}`],
+        });
+        const view = viewResult as unknown as {
+          stake: bigint; shares: bigint;
+          delegatedStake: bigint; totalStake: bigint;
+        };
+        await this.db.updateValidatorLiveData(addr, {
+          totalStake: view.totalStake.toString(),
+          totalShares: view.shares.toString(),
+          delegatedStake: view.delegatedStake.toString(),
+        });
+      } catch {
+        // validatorView may fail for some validators
+      }
+    }
+
+    // Sync delegator counts per validator
+    for (const addr of activeList) {
+      try {
+        const countResult = await this.client.readContract({
+          address: stakingAddr,
+          abi: [{
+            type: "function", name: "validatorDelegatorCount",
+            inputs: [{ type: "address", name: "_validator" }],
+            outputs: [{ type: "uint256", name: "" }],
+            stateMutability: "view",
+          }] as const,
+          functionName: "validatorDelegatorCount",
+          args: [addr as `0x${string}`],
+        });
+        await this.db.updateValidatorDelegatorCount(addr, Number(countResult));
+      } catch {
+        // May not be available
+      }
+    }
+
+    // Sync epoch details
+    await this.syncEpochDetails();
+  }
+
+  private async syncEpochDetails() {
+    const stakingAddr = config.stakingContract;
+    try {
+      const currentEpoch = await this.client.readContract({
+        address: stakingAddr,
+        abi: [{
+          type: "function", name: "epoch",
+          inputs: [], outputs: [{ type: "uint256", name: "" }],
+          stateMutability: "view",
+        }] as const,
+        functionName: "epoch",
+      });
+      const epochNum = currentEpoch as bigint;
+
+      // Epoch data alternates between even/odd storage slots
+      const fnName = epochNum % 2n === 0n ? "epochEven" : "epochOdd";
+      const epochAbi = [{
+        type: "function" as const, name: fnName,
+        inputs: [] as const,
+        outputs: [
+          { type: "uint256", name: "start" },
+          { type: "uint256", name: "end" },
+          { type: "uint256", name: "inflation" },
+          { type: "uint256", name: "weight" },
+          { type: "uint256", name: "weightDeposit" },
+          { type: "uint256", name: "weightWithdrawal" },
+          { type: "uint256", name: "vcount" },
+          { type: "uint256", name: "claimed" },
+          { type: "uint256", name: "stakeDeposit" },
+          { type: "uint256", name: "stakeWithdrawal" },
+          { type: "uint256", name: "slashed" },
+        ],
+        stateMutability: "view" as const,
+      }];
+
+      const epochData = await this.client.readContract({
+        address: stakingAddr,
+        abi: epochAbi,
+        functionName: fnName,
+      });
+      const data = epochData as unknown as {
+        inflation: bigint; weight: bigint;
+        vcount: bigint; stakeDeposit: bigint;
+        stakeWithdrawal: bigint; slashed: bigint;
+      };
+
+      await this.db.upsertEpoch(epochNum, {
+        inflationAmount: data.inflation.toString(),
+        validatorCount: Number(data.vcount),
+        totalWeight: data.weight.toString(),
+        totalStakeDeposited: data.stakeDeposit.toString(),
+        totalStakeWithdrawn: data.stakeWithdrawal.toString(),
+        totalSlashed: data.slashed.toString(),
+      });
+    } catch (err) {
+      // Epoch sync is best-effort
     }
   }
 

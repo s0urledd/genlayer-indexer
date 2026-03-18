@@ -30,6 +30,9 @@ CREATE TABLE IF NOT EXISTS validators (
   operator TEXT,
   status TEXT NOT NULL DEFAULT 'active',
   total_stake NUMERIC NOT NULL DEFAULT 0,
+  total_shares NUMERIC NOT NULL DEFAULT 0,
+  delegated_stake NUMERIC NOT NULL DEFAULT 0,
+  selection_weight NUMERIC NOT NULL DEFAULT 0,
   total_rewards NUMERIC NOT NULL DEFAULT 0,
   total_delegator_rewards NUMERIC NOT NULL DEFAULT 0,
   total_fee_rewards NUMERIC NOT NULL DEFAULT 0,
@@ -38,6 +41,7 @@ CREATE TABLE IF NOT EXISTS validators (
   total_delegator_slashed NUMERIC NOT NULL DEFAULT 0,
   prime_count INTEGER NOT NULL DEFAULT 0,
   slash_count INTEGER NOT NULL DEFAULT 0,
+  delegator_count INTEGER NOT NULL DEFAULT 0,
   last_prime_epoch BIGINT,
   last_seen_block BIGINT,
   joined_at_block BIGINT,
@@ -52,6 +56,10 @@ CREATE TABLE IF NOT EXISTS epochs (
   advanced_at_timestamp TIMESTAMPTZ,
   finalized_at_timestamp TIMESTAMPTZ,
   inflation_amount NUMERIC,
+  total_weight NUMERIC,
+  total_stake_deposited NUMERIC,
+  total_stake_withdrawn NUMERIC,
+  total_slashed NUMERIC,
   validator_count INTEGER,
   updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
 );
@@ -63,6 +71,8 @@ CREATE TABLE IF NOT EXISTS delegations (
   delegator_address TEXT NOT NULL,
   total_deposited NUMERIC NOT NULL DEFAULT 0,
   total_withdrawn NUMERIC NOT NULL DEFAULT 0,
+  current_shares NUMERIC NOT NULL DEFAULT 0,
+  current_stake NUMERIC NOT NULL DEFAULT 0,
   updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
   UNIQUE(validator_address, delegator_address)
 );
@@ -132,9 +142,19 @@ DO $$ BEGIN
   ALTER TABLE validators ADD COLUMN IF NOT EXISTS total_fee_rewards NUMERIC NOT NULL DEFAULT 0;
   ALTER TABLE validators ADD COLUMN IF NOT EXISTS total_fee_penalties NUMERIC NOT NULL DEFAULT 0;
   ALTER TABLE validators ADD COLUMN IF NOT EXISTS total_delegator_slashed NUMERIC NOT NULL DEFAULT 0;
+  ALTER TABLE validators ADD COLUMN IF NOT EXISTS total_shares NUMERIC NOT NULL DEFAULT 0;
+  ALTER TABLE validators ADD COLUMN IF NOT EXISTS delegated_stake NUMERIC NOT NULL DEFAULT 0;
+  ALTER TABLE validators ADD COLUMN IF NOT EXISTS selection_weight NUMERIC NOT NULL DEFAULT 0;
+  ALTER TABLE validators ADD COLUMN IF NOT EXISTS delegator_count INTEGER NOT NULL DEFAULT 0;
   ALTER TABLE validator_tx_participation ADD COLUMN IF NOT EXISTS vote_result INTEGER;
   ALTER TABLE consensus_transactions ADD COLUMN IF NOT EXISTS appellant TEXT;
   ALTER TABLE consensus_transactions ADD COLUMN IF NOT EXISTS appeal_bond NUMERIC;
+  ALTER TABLE epochs ADD COLUMN IF NOT EXISTS total_weight NUMERIC;
+  ALTER TABLE epochs ADD COLUMN IF NOT EXISTS total_stake_deposited NUMERIC;
+  ALTER TABLE epochs ADD COLUMN IF NOT EXISTS total_stake_withdrawn NUMERIC;
+  ALTER TABLE epochs ADD COLUMN IF NOT EXISTS total_slashed NUMERIC;
+  ALTER TABLE delegations ADD COLUMN IF NOT EXISTS current_shares NUMERIC NOT NULL DEFAULT 0;
+  ALTER TABLE delegations ADD COLUMN IF NOT EXISTS current_stake NUMERIC NOT NULL DEFAULT 0;
 EXCEPTION WHEN others THEN NULL;
 END $$;
 
