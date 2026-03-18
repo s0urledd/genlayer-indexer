@@ -885,11 +885,13 @@ export class Database {
          END as uptime_percentage
        FROM epochs e
        LEFT JOIN (
-         SELECT (args->>'epoch')::bigint as epoch, COUNT(DISTINCT LOWER(args->>'validator')) as primed_count
+         SELECT (args->>'epoch')::bigint as epoch,
+           COUNT(DISTINCT LOWER(args->>'validator')) FILTER (WHERE LOWER(args->>'validator') != '${ZERO_ADDRESS}') as primed_count
          FROM events
          WHERE event_name = 'ValidatorPrime'
          GROUP BY (args->>'epoch')::bigint
        ) p ON p.epoch = e.epoch
+       WHERE e.advanced_at_block IS NOT NULL
        ORDER BY e.epoch DESC
        LIMIT $1`,
       [epochCount]
@@ -962,7 +964,7 @@ export class Database {
     `);
     const row = result.rows[0];
 
-    // Network uptime = avg of last 30 epochs
+    // Network uptime = avg of last 30 actual epochs (skip gaps, exclude incomplete epochs)
     const uptimeResult = await this.pool.query(`
       SELECT COALESCE(AVG(
         CASE WHEN COALESCE(e.validator_count,
@@ -975,13 +977,13 @@ export class Database {
           ELSE 0
         END
       ), 0) as network_uptime
-      FROM epochs e
+      FROM (SELECT * FROM epochs WHERE advanced_at_block IS NOT NULL ORDER BY epoch DESC LIMIT 30) e
       LEFT JOIN (
-        SELECT (args->>'epoch')::bigint as epoch, COUNT(DISTINCT LOWER(args->>'validator')) as primed_count
+        SELECT (args->>'epoch')::bigint as epoch,
+          COUNT(DISTINCT LOWER(args->>'validator')) FILTER (WHERE LOWER(args->>'validator') != '${ZERO_ADDRESS}') as primed_count
         FROM events WHERE event_name = 'ValidatorPrime'
         GROUP BY (args->>'epoch')::bigint
       ) p ON p.epoch = e.epoch
-      WHERE e.epoch >= COALESCE((SELECT MAX(epoch) - 29 FROM epochs), 0)
     `);
 
     return {
