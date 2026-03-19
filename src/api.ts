@@ -44,8 +44,8 @@ export class Api {
     this.indexer = indexer;
     this.registerRoutes();
     this.server = http.createServer((req, res) => this.handleRequest(req, res));
-    this.server.listen(port, () => {
-      console.log(`API server listening on http://localhost:${port}`);
+    this.server.listen(port, "0.0.0.0", () => {
+      console.log(`API server listening on http://0.0.0.0:${port}`);
       console.log("Available endpoints:");
       for (const key of this.routes.keys()) {
         console.log(`  ${key}`);
