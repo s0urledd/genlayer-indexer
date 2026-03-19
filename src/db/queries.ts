@@ -630,13 +630,18 @@ export class Database {
        ) d ON d.validator_address = v.address
        LEFT JOIN (
          SELECT LOWER(args->>'validator') as validator,
-           ROUND(COUNT(*)::numeric / GREATEST(
-             (SELECT COUNT(*) FROM (SELECT 1 FROM epochs ORDER BY epoch DESC LIMIT 30) _e), 1
-           ) * 100, 2) as uptime_pct
+           ROUND(
+             COUNT(DISTINCT (args->>'epoch'))::numeric / GREATEST(
+               (SELECT COUNT(*) FROM epochs WHERE advanced_at_block IS NOT NULL), 1
+             ) * 100, 2
+           ) as uptime_pct
          FROM events
          WHERE event_name = 'ValidatorPrime'
+           AND LOWER(args->>'validator') != '${ZERO_ADDRESS}'
            AND (args->>'epoch')::bigint >= COALESCE(
-             (SELECT MIN(epoch) FROM (SELECT epoch FROM epochs ORDER BY epoch DESC LIMIT 30) _recent), 0
+             (SELECT MIN(epoch) FROM (
+               SELECT epoch FROM epochs WHERE advanced_at_block IS NOT NULL ORDER BY epoch DESC LIMIT 30
+             ) _recent), 0
            )
          GROUP BY LOWER(args->>'validator')
        ) u ON u.validator = v.address
@@ -739,7 +744,7 @@ export class Database {
         (SELECT COALESCE(SUM(total_stake), 0) FROM validators WHERE address != '${zeroAddr}') as total_staked,
         (SELECT COALESCE(SUM(total_rewards), 0) FROM validators WHERE address != '${zeroAddr}') as total_rewards_distributed,
         (SELECT COALESCE(SUM(total_slashed), 0) FROM validators WHERE address != '${zeroAddr}') as total_slashed,
-        (SELECT MAX(epoch) FROM epochs) as latest_epoch,
+        (SELECT MAX(epoch) FROM epochs WHERE advanced_at_block IS NOT NULL) as latest_epoch,
         (SELECT COUNT(*) FROM events) as total_events,
         (SELECT MAX(block_number) FROM events) as latest_indexed_block,
         (SELECT COUNT(*) FROM events WHERE block_timestamp > NOW() - INTERVAL '1 hour') as events_last_hour,
@@ -1033,6 +1038,7 @@ export class Database {
        LEFT JOIN events ev ON ev.event_name = 'ValidatorPrime'
          AND LOWER(ev.args->>'validator') = $1
          AND (ev.args->>'epoch')::bigint = e.epoch
+       WHERE e.advanced_at_block IS NOT NULL
        ORDER BY e.epoch DESC
        LIMIT $2`,
       [address.toLowerCase(), epochCount]
@@ -1051,7 +1057,7 @@ export class Database {
         (SELECT COUNT(*) FROM validators WHERE status = 'active' AND address != '${ZERO_ADDRESS}') as active_validators,
         (SELECT COUNT(*) FROM validators WHERE status = 'banned' AND address != '${ZERO_ADDRESS}') as banned_validators,
         (SELECT COUNT(*) FROM validators WHERE status = 'quarantined' AND address != '${ZERO_ADDRESS}') as quarantined_validators,
-        (SELECT MAX(epoch) FROM epochs) as latest_epoch,
+        (SELECT MAX(epoch) FROM epochs WHERE advanced_at_block IS NOT NULL) as latest_epoch,
         (SELECT COALESCE(SUM(total_stake), 0) FROM validators WHERE address != '${ZERO_ADDRESS}') as total_staked,
         -- avg_uptime removed; network_uptime (computed below) is the primary metric
         (SELECT COUNT(*) FROM events WHERE block_timestamp > NOW() - INTERVAL '24 hours') as event_throughput_24h
@@ -1125,12 +1131,19 @@ export class Database {
        ) d ON d.validator_address = v.address
        LEFT JOIN (
          SELECT LOWER(args->>'validator') as validator,
-           ROUND(COUNT(*)::numeric / GREATEST(
-             (SELECT COUNT(*) FROM (SELECT 1 FROM epochs ORDER BY epoch DESC LIMIT 30) _e), 1
-           ) * 100, 2) as uptime_pct
+           ROUND(
+             COUNT(DISTINCT (args->>'epoch'))::numeric / GREATEST(
+               (SELECT COUNT(*) FROM epochs WHERE advanced_at_block IS NOT NULL), 1
+             ) * 100, 2
+           ) as uptime_pct
          FROM events
          WHERE event_name = 'ValidatorPrime'
-           AND (args->>'epoch')::bigint >= COALESCE((SELECT MAX(epoch) - 29 FROM epochs), 0)
+           AND LOWER(args->>'validator') != '${ZERO_ADDRESS}'
+           AND (args->>'epoch')::bigint >= COALESCE(
+             (SELECT MIN(epoch) FROM (
+               SELECT epoch FROM epochs WHERE advanced_at_block IS NOT NULL ORDER BY epoch DESC LIMIT 30
+             ) _recent), 0
+           )
          GROUP BY LOWER(args->>'validator')
        ) u ON u.validator = v.address
        WHERE v.address != '${ZERO_ADDRESS}'
@@ -1381,12 +1394,12 @@ export class Database {
            AND category = 'slashing'
            AND block_timestamp > NOW() - INTERVAL '30 days'
         ) as recent_slash_count_30d,
-        -- recent prime rate over last 30 epochs
+        -- recent prime rate over last 30 real epochs (excluding phantom epoch records)
         (SELECT CASE WHEN COUNT(*) > 0
           THEN ROUND(
             COUNT(*) FILTER (WHERE prime_ev.id IS NOT NULL)::numeric / COUNT(*) * 100, 2
-          ) ELSE 100 END
-         FROM (SELECT epoch FROM epochs ORDER BY epoch DESC LIMIT 30) recent_e
+          ) ELSE 0 END
+         FROM (SELECT epoch FROM epochs WHERE advanced_at_block IS NOT NULL ORDER BY epoch DESC LIMIT 30) recent_e
          LEFT JOIN events prime_ev ON prime_ev.event_name = 'ValidatorPrime'
            AND LOWER(prime_ev.args->>'validator') = $1
            AND (prime_ev.args->>'epoch')::bigint = recent_e.epoch
@@ -1399,14 +1412,21 @@ export class Database {
          FROM delegations GROUP BY validator_address
        ) d ON d.validator_address = v.address
        LEFT JOIN (
-         SELECT args->>'validator' as validator,
-           ROUND(COUNT(*)::numeric / GREATEST(
-             (SELECT COUNT(*) FROM (SELECT 1 FROM epochs ORDER BY epoch DESC LIMIT 30) _e), 1
-           ) * 100, 2) as uptime_pct
+         SELECT LOWER(args->>'validator') as validator,
+           ROUND(
+             COUNT(DISTINCT (args->>'epoch'))::numeric / GREATEST(
+               (SELECT COUNT(*) FROM epochs WHERE advanced_at_block IS NOT NULL), 1
+             ) * 100, 2
+           ) as uptime_pct
          FROM events
          WHERE event_name = 'ValidatorPrime'
-           AND (args->>'epoch')::bigint >= COALESCE((SELECT MAX(epoch) - 29 FROM epochs), 0)
-         GROUP BY args->>'validator'
+           AND LOWER(args->>'validator') != '${ZERO_ADDRESS}'
+           AND (args->>'epoch')::bigint >= COALESCE(
+             (SELECT MIN(epoch) FROM (
+               SELECT epoch FROM epochs WHERE advanced_at_block IS NOT NULL ORDER BY epoch DESC LIMIT 30
+             ) _recent), 0
+           )
+         GROUP BY LOWER(args->>'validator')
        ) u ON u.validator = v.address
        WHERE v.address = $1`,
       [addr]
@@ -1472,14 +1492,21 @@ export class Database {
            FROM delegations GROUP BY validator_address
          ) d ON d.validator_address = v.address
          LEFT JOIN (
-           SELECT args->>'validator' as validator,
-             ROUND(COUNT(*)::numeric / GREATEST(
-               (SELECT COUNT(*) FROM (SELECT 1 FROM epochs ORDER BY epoch DESC LIMIT 30) _e), 1
-             ) * 100, 2) as uptime_pct
+           SELECT LOWER(args->>'validator') as validator,
+             ROUND(
+               COUNT(DISTINCT (args->>'epoch'))::numeric / GREATEST(
+                 (SELECT COUNT(*) FROM epochs WHERE advanced_at_block IS NOT NULL), 1
+               ) * 100, 2
+             ) as uptime_pct
            FROM events
            WHERE event_name = 'ValidatorPrime'
-             AND (args->>'epoch')::bigint >= COALESCE((SELECT MAX(epoch) - 29 FROM epochs), 0)
-           GROUP BY args->>'validator'
+             AND LOWER(args->>'validator') != '${ZERO_ADDRESS}'
+             AND (args->>'epoch')::bigint >= COALESCE(
+               (SELECT MIN(epoch) FROM (
+                 SELECT epoch FROM epochs WHERE advanced_at_block IS NOT NULL ORDER BY epoch DESC LIMIT 30
+               ) _recent), 0
+             )
+           GROUP BY LOWER(args->>'validator')
          ) u ON u.validator = v.address
          ${where}
        ) sub
