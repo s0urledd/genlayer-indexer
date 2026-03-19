@@ -920,6 +920,106 @@ export class Database {
     return result.rows;
   }
 
+  // ============================================================
+  // Network Latency (real on-chain metrics, not indexer RPC)
+  // ============================================================
+
+  async getNetworkLatency() {
+    // 1. Block time — avg and p95 from recent block timestamp diffs
+    const blockTimeResult = await this.pool.query(`
+      WITH recent_blocks AS (
+        SELECT block_timestamp,
+          LAG(block_timestamp) OVER (ORDER BY block_number) as prev_timestamp
+        FROM (
+          SELECT DISTINCT ON (block_number) block_number, block_timestamp
+          FROM events
+          WHERE block_timestamp IS NOT NULL
+          ORDER BY block_number DESC, id DESC
+          LIMIT 201
+        ) sub
+        ORDER BY block_number
+      ),
+      diffs AS (
+        SELECT EXTRACT(EPOCH FROM block_timestamp - prev_timestamp) as diff_seconds
+        FROM recent_blocks
+        WHERE prev_timestamp IS NOT NULL
+          AND block_timestamp > prev_timestamp
+      )
+      SELECT
+        ROUND(AVG(diff_seconds)::numeric, 2) as avg_seconds,
+        ROUND(PERCENTILE_CONT(0.5) WITHIN GROUP (ORDER BY diff_seconds)::numeric, 2) as p50_seconds,
+        ROUND(PERCENTILE_CONT(0.95) WITHIN GROUP (ORDER BY diff_seconds)::numeric, 2) as p95_seconds,
+        ROUND(MIN(diff_seconds)::numeric, 2) as min_seconds,
+        ROUND(MAX(diff_seconds)::numeric, 2) as max_seconds,
+        COUNT(*) as sample_count
+      FROM diffs
+    `);
+
+    // 2. Tx finality — time from created_at to finalized_at
+    const txFinalityResult = await this.pool.query(`
+      WITH finalized AS (
+        SELECT
+          EXTRACT(EPOCH FROM
+            (SELECT block_timestamp FROM events WHERE block_number = ct.finalized_at_block LIMIT 1) -
+            ct.created_at_timestamp
+          ) as finality_seconds
+        FROM consensus_transactions ct
+        WHERE ct.finalized_at_block IS NOT NULL
+          AND ct.created_at_timestamp IS NOT NULL
+        ORDER BY ct.finalized_at_block DESC
+        LIMIT 100
+      )
+      SELECT
+        ROUND(AVG(finality_seconds)::numeric, 2) as avg_seconds,
+        ROUND(PERCENTILE_CONT(0.5) WITHIN GROUP (ORDER BY finality_seconds)::numeric, 2) as p50_seconds,
+        ROUND(PERCENTILE_CONT(0.95) WITHIN GROUP (ORDER BY finality_seconds)::numeric, 2) as p95_seconds,
+        ROUND(MIN(finality_seconds)::numeric, 2) as min_seconds,
+        ROUND(MAX(finality_seconds)::numeric, 2) as max_seconds,
+        COUNT(*) as sample_count
+      FROM finalized
+      WHERE finality_seconds > 0
+    `);
+
+    // 3. Epoch duration — from epoch timestamps
+    const epochDurationResult = await this.pool.query(`
+      WITH epoch_diffs AS (
+        SELECT
+          e1.epoch,
+          EXTRACT(EPOCH FROM e1.advanced_at_timestamp - e2.advanced_at_timestamp) as duration_seconds
+        FROM epochs e1
+        INNER JOIN epochs e2 ON e2.epoch = e1.epoch - 1
+        WHERE e1.advanced_at_timestamp IS NOT NULL
+          AND e2.advanced_at_timestamp IS NOT NULL
+        ORDER BY e1.epoch DESC
+        LIMIT 30
+      )
+      SELECT
+        ROUND(AVG(duration_seconds)::numeric, 2) as avg_seconds,
+        ROUND(PERCENTILE_CONT(0.5) WITHIN GROUP (ORDER BY duration_seconds)::numeric, 2) as p50_seconds,
+        ROUND(PERCENTILE_CONT(0.95) WITHIN GROUP (ORDER BY duration_seconds)::numeric, 2) as p95_seconds,
+        ROUND(MIN(duration_seconds)::numeric, 2) as min_seconds,
+        ROUND(MAX(duration_seconds)::numeric, 2) as max_seconds,
+        COUNT(*) as sample_count
+      FROM epoch_diffs
+      WHERE duration_seconds > 0
+    `);
+
+    const parse = (row: Record<string, string | null>) => ({
+      avg_seconds: row.avg_seconds ? parseFloat(row.avg_seconds) : null,
+      p50_seconds: row.p50_seconds ? parseFloat(row.p50_seconds) : null,
+      p95_seconds: row.p95_seconds ? parseFloat(row.p95_seconds) : null,
+      min_seconds: row.min_seconds ? parseFloat(row.min_seconds) : null,
+      max_seconds: row.max_seconds ? parseFloat(row.max_seconds) : null,
+      sample_count: row.sample_count ? parseInt(row.sample_count) : 0,
+    });
+
+    return {
+      block_time: parse(blockTimeResult.rows[0] || {}),
+      tx_finality: parse(txFinalityResult.rows[0] || {}),
+      epoch_duration: parse(epochDurationResult.rows[0] || {}),
+    };
+  }
+
   async getValidatorUptimeByEpoch(address: string, epochCount = 30) {
     const result = await this.pool.query(
       `SELECT
