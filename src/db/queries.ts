@@ -389,10 +389,11 @@ export class Database {
     createdAtTimestamp: Date;
     acceptedAtBlock: bigint;
     finalizedAtBlock: bigint;
+    finalizedAtTimestamp: Date;
   }>) {
     await this.pool.query(
-      `INSERT INTO consensus_transactions (tx_id, recipient, activator, leader, status, vote_type, result_type, rotation_count, appeal_count, validators, created_at_block, created_at_timestamp, accepted_at_block, finalized_at_block, updated_at)
-       VALUES ($1, $2, $3, $4, COALESCE($5, 'pending'), $6, $7, COALESCE($8, 0), COALESCE($9, 0), $10, $11, $12, $13, $14, NOW())
+      `INSERT INTO consensus_transactions (tx_id, recipient, activator, leader, status, vote_type, result_type, rotation_count, appeal_count, validators, created_at_block, created_at_timestamp, accepted_at_block, finalized_at_block, finalized_at_timestamp, updated_at)
+       VALUES ($1, $2, $3, $4, COALESCE($5, 'pending'), $6, $7, COALESCE($8, 0), COALESCE($9, 0), $10, $11, $12, $13, $14, $15, NOW())
        ON CONFLICT (tx_id) DO UPDATE SET
          recipient = COALESCE($2, consensus_transactions.recipient),
          activator = COALESCE($3, consensus_transactions.activator),
@@ -407,6 +408,7 @@ export class Database {
          created_at_timestamp = COALESCE($12, consensus_transactions.created_at_timestamp),
          accepted_at_block = COALESCE($13, consensus_transactions.accepted_at_block),
          finalized_at_block = COALESCE($14, consensus_transactions.finalized_at_block),
+         finalized_at_timestamp = COALESCE($15, consensus_transactions.finalized_at_timestamp),
          updated_at = NOW()`,
       [
         txId,
@@ -423,6 +425,7 @@ export class Database {
         data.createdAtTimestamp || null,
         data.acceptedAtBlock?.toString() || null,
         data.finalizedAtBlock?.toString() || null,
+        data.finalizedAtTimestamp || null,
       ]
     );
   }
@@ -925,10 +928,12 @@ export class Database {
   // ============================================================
 
   async getNetworkLatency() {
-    // 1. Block time — avg and p95 from recent block timestamp diffs
+    // 1. Block time — use actual block_number gaps to avoid skipping empty blocks
+    //    Takes consecutive event-bearing blocks, divides timestamp diff by block_number diff
     const blockTimeResult = await this.pool.query(`
       WITH recent_blocks AS (
-        SELECT block_timestamp,
+        SELECT block_number, block_timestamp,
+          LAG(block_number) OVER (ORDER BY block_number) as prev_block,
           LAG(block_timestamp) OVER (ORDER BY block_number) as prev_timestamp
         FROM (
           SELECT DISTINCT ON (block_number) block_number, block_timestamp
@@ -940,10 +945,13 @@ export class Database {
         ORDER BY block_number
       ),
       diffs AS (
-        SELECT EXTRACT(EPOCH FROM block_timestamp - prev_timestamp) as diff_seconds
+        SELECT
+          EXTRACT(EPOCH FROM block_timestamp - prev_timestamp)
+            / NULLIF(block_number - prev_block, 0) as diff_seconds
         FROM recent_blocks
         WHERE prev_timestamp IS NOT NULL
           AND block_timestamp > prev_timestamp
+          AND block_number > prev_block
       )
       SELECT
         ROUND(AVG(diff_seconds)::numeric, 2) as avg_seconds,
@@ -955,16 +963,13 @@ export class Database {
       FROM diffs
     `);
 
-    // 2. Tx finality — time from created_at to finalized_at
+    // 2. Tx finality — time from created_at to finalized_at (using stored timestamps)
     const txFinalityResult = await this.pool.query(`
       WITH finalized AS (
         SELECT
-          EXTRACT(EPOCH FROM
-            (SELECT block_timestamp FROM events WHERE block_number = ct.finalized_at_block LIMIT 1) -
-            ct.created_at_timestamp
-          ) as finality_seconds
+          EXTRACT(EPOCH FROM ct.finalized_at_timestamp - ct.created_at_timestamp) as finality_seconds
         FROM consensus_transactions ct
-        WHERE ct.finalized_at_block IS NOT NULL
+        WHERE ct.finalized_at_timestamp IS NOT NULL
           AND ct.created_at_timestamp IS NOT NULL
         ORDER BY ct.finalized_at_block DESC
         LIMIT 100
