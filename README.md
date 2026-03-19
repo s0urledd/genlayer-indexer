@@ -66,8 +66,8 @@ Which endpoints to use for each page:
 
 | Section | Endpoint | Notes |
 |---------|----------|-------|
-| Top bar metrics | `GET /stats/summary` | Single call: validators, epoch, participation, uptime, staked, latency |
-| Top validators | `GET /validators/top?sort=stake&limit=10` | Also `sort=participation` or `sort=rewards` |
+| Top bar metrics | `GET /stats/summary` | Single call: validators, epoch, uptime, staked, latency |
+| Top validators | `GET /validators/top?sort=stake&limit=10` | Also `sort=uptime` or `sort=rewards` |
 | Recent activity | `GET /events/feed?limit=20` | Pre-normalized: type, title, subtitle, severity |
 | Network uptime chart | `GET /stats/network-uptime?epochs=30` | Chart-ready array |
 | Event activity chart | `GET /stats/event-activity?hours=24` | Hourly breakdown by category |
@@ -77,15 +77,15 @@ Which endpoints to use for each page:
 
 | Section | Endpoint | Notes |
 |---------|----------|-------|
-| Validator table | `GET /validators?sort=participation_score&order=desc&limit=50` | Sortable columns: `total_stake`, `participation_score`, `total_rewards`, `total_slashed`, `uptime_percentage` |
+| Validator table | `GET /validators?sort=uptime_percentage&order=desc&limit=50` | Sortable columns: `total_stake`, `uptime_percentage`, `total_rewards`, `total_slashed`, `prime_count`, `slash_count`, `delegated_stake` |
 | Filter by status | `GET /validators?status=active` | Values: `active`, `banned`, `quarantined`, `exiting` |
 
 ### Validator Detail Page
 
 | Section | Endpoint | Notes |
 |---------|----------|-------|
-| Header & stats | `GET /validators/:address` | Enriched: self_stake, delegated_stake, participation_score, recent_slash_count_30d, recent_prime_rate_30_epochs, latest_status_change_at, last_event_at |
-| Participation chart | `GET /validators/:address/participation-history?epochs=30` | Chart-ready: `[{ epoch, participation_score, prime_present, slashed, status }]` |
+| Header & stats | `GET /validators/:address` | Enriched: self_stake, delegated_stake, uptime_percentage, recent_slash_count_30d, recent_prime_rate_30_epochs, latest_status_change_at, last_event_at |
+| Prime rate chart | `GET /validators/:address/participation-history?epochs=30` | Chart-ready: `[{ epoch, prime_rate, prime_present, slashed, status }]` |
 | Reward chart | `GET /validators/:address/reward-history?limit=30` | Chart-ready: `[{ epoch, validator_rewards, delegator_rewards, fee_rewards, fee_penalties, net_rewards }]` |
 | Slash timeline | `GET /validators/:address/slash-history` | `[{ timestamp, epoch, slash_type, amount, reason, resulting_status }]` |
 | Uptime grid | `GET /validators/:address/uptime?epochs=30` | Per-epoch primed/missed |
@@ -118,11 +118,11 @@ All endpoints return JSON. Default port: `3000`.
 | Endpoint | Description |
 |----------|-------------|
 | `GET /validators` | List validators with sort/order support |
-| `GET /validators/top` | Top N validators by `?sort=stake\|participation\|rewards` |
+| `GET /validators/top` | Top N validators by `?sort=stake\|uptime\|rewards` |
 | `GET /validators/:address` | Enriched detail — includes `latest_status_change_at`, `last_event_at`, `recent_slash_count_30d`, `recent_prime_rate_30_epochs` |
 | `GET /validators/:address/history` | All events for this validator |
 | `GET /validators/:address/uptime` | Epoch-by-epoch prime/miss (technical metric) |
-| `GET /validators/:address/participation-history` | Chart-ready per-epoch participation trend |
+| `GET /validators/:address/participation-history` | Chart-ready per-epoch prime rate trend |
 | `GET /validators/:address/reward-history` | Chart-ready per-epoch reward breakdown |
 | `GET /validators/:address/slash-history` | Slash/quarantine/ban timeline |
 | `GET /validators/:address/delegations` | Delegations for this validator |
@@ -167,7 +167,7 @@ All list endpoints support:
 | `sort` | varies | Sort field (whitelisted per endpoint) |
 | `order` | `desc` | `asc` or `desc` |
 
-**Validator sort fields:** `total_stake`, `participation_score`, `total_rewards`, `total_slashed`, `prime_count`, `slash_count`, `delegated_stake`, `uptime_percentage`
+**Validator sort fields:** `total_stake`, `total_rewards`, `total_slashed`, `prime_count`, `slash_count`, `delegated_stake`, `uptime_percentage`
 
 **Event sort fields:** `block_number`, `block_timestamp`, `event_name`, `category`
 
@@ -177,13 +177,14 @@ All list endpoints support:
 
 | Metric | Definition | Primary? |
 |--------|-----------|----------|
-| `participation_score` | `prime_count / (prime_count + slash_count) × 100` — Duty completion rate | Yes |
-| `uptime_percentage` | Prime events in last 30 epochs / 30 — Epoch presence rate | Secondary |
+| `uptime_percentage` | Prime events in last 30 epochs / 30 × 100 — Epoch presence rate | Yes |
+| `prime_rate` | Running prime rate in participation-history — cumulative prime/epochs | Chart |
 | `network_uptime` | Avg % of validators that primed across last 30 epochs | Dashboard |
+| `slash_count` | Total slash events received — shown separately, not mixed into uptime | Validator |
 | `rpc_latency` | `getBlockNumber()` round-trip time — Node response speed | Infrastructure |
 | `event_activity` | Event count per hour by category — Network activity level | Dashboard |
 
-> **`participation_score`** is the primary validator health metric for the UI. **`uptime_percentage`** is secondary/technical.
+> **`uptime_percentage`** is the primary validator health metric. **`slash_count`** and **`total_slashed`** are shown separately — mixing epoch-level primes with tx-level slashes into a single score is misleading.
 
 ## Validator Status Enum
 

@@ -616,10 +616,6 @@ export class Database {
         COALESCE(d.delegated_stake, 0) as delegated_stake,
         COALESCE(d.delegator_count, 0) as delegator_count,
         v.total_stake - COALESCE(d.delegated_stake, 0) as self_stake,
-        CASE WHEN v.prime_count + v.slash_count > 0
-          THEN ROUND(v.prime_count::numeric / (v.prime_count + v.slash_count) * 100, 2)
-          ELSE 100
-        END as participation_score,
         COALESCE(u.uptime_pct, 100) as uptime_percentage
        FROM validators v
        LEFT JOIN (
@@ -654,11 +650,7 @@ export class Database {
       `SELECT v.*,
         COALESCE(d.delegated_stake, 0) as delegated_stake,
         COALESCE(d.delegator_count, 0) as delegator_count,
-        v.total_stake - COALESCE(d.delegated_stake, 0) as self_stake,
-        CASE WHEN v.prime_count + v.slash_count > 0
-          THEN ROUND(v.prime_count::numeric / (v.prime_count + v.slash_count) * 100, 2)
-          ELSE 100
-        END as participation_score
+        v.total_stake - COALESCE(d.delegated_stake, 0) as self_stake
        FROM validators v
        LEFT JOIN (
          SELECT validator_address,
@@ -957,10 +949,7 @@ export class Database {
         (SELECT COUNT(*) FROM validators WHERE status = 'quarantined' AND address != '${ZERO_ADDRESS}') as quarantined_validators,
         (SELECT MAX(epoch) FROM epochs) as latest_epoch,
         (SELECT COALESCE(SUM(total_stake), 0) FROM validators WHERE address != '${ZERO_ADDRESS}') as total_staked,
-        (SELECT CASE WHEN SUM(prime_count + slash_count) > 0
-          THEN ROUND(SUM(prime_count)::numeric / SUM(prime_count + slash_count) * 100, 2)
-          ELSE 100
-        END FROM validators WHERE status = 'active' AND address != '${ZERO_ADDRESS}') as avg_participation,
+        -- avg_uptime removed; network_uptime (computed below) is the primary metric
         (SELECT COUNT(*) FROM events WHERE block_timestamp > NOW() - INTERVAL '24 hours') as event_throughput_24h
     `);
     const row = result.rows[0];
@@ -998,7 +987,6 @@ export class Database {
       total_validators: parseInt(row.total_validators),
       latest_epoch: row.latest_epoch,
       total_staked: row.total_staked,
-      avg_participation: parseFloat(row.avg_participation),
       network_uptime: parseFloat(parseFloat(uptimeResult.rows[0].network_uptime).toFixed(2)),
       event_throughput_24h: parseInt(row.event_throughput_24h),
       rpc_latency_avg_ms: rpcLatency?.avgMs ?? null,
@@ -1010,10 +998,10 @@ export class Database {
   // Top Validators (sorted by different criteria)
   // ============================================================
 
-  async getTopValidators(sort: "stake" | "participation" | "rewards" = "stake", limit = 10) {
+  async getTopValidators(sort: "stake" | "uptime" | "rewards" = "stake", limit = 10) {
     const orderBy = {
       stake: "v.total_stake DESC",
-      participation: "participation_score DESC, v.total_stake DESC",
+      uptime: "uptime_percentage DESC, v.total_stake DESC",
       rewards: "v.total_rewards DESC",
     }[sort];
 
@@ -1023,10 +1011,7 @@ export class Database {
         COALESCE(d.delegated_stake, 0) as delegated_stake,
         COALESCE(d.delegator_count, 0) as delegator_count,
         v.total_stake - COALESCE(d.delegated_stake, 0) as self_stake,
-        CASE WHEN v.prime_count + v.slash_count > 0
-          THEN ROUND(v.prime_count::numeric / (v.prime_count + v.slash_count) * 100, 2)
-          ELSE 100
-        END as participation_score
+        COALESCE(u.uptime_pct, 100) as uptime_percentage
        FROM validators v
        LEFT JOIN (
          SELECT validator_address,
@@ -1034,6 +1019,16 @@ export class Database {
            COUNT(*) FILTER (WHERE total_deposited > total_withdrawn) as delegator_count
          FROM delegations GROUP BY validator_address
        ) d ON d.validator_address = v.address
+       LEFT JOIN (
+         SELECT LOWER(args->>'validator') as validator,
+           ROUND(COUNT(*)::numeric / GREATEST(
+             (SELECT COUNT(*) FROM (SELECT 1 FROM epochs ORDER BY epoch DESC LIMIT 30) _e), 1
+           ) * 100, 2) as uptime_pct
+         FROM events
+         WHERE event_name = 'ValidatorPrime'
+           AND (args->>'epoch')::bigint >= COALESCE((SELECT MAX(epoch) - 29 FROM epochs), 0)
+         GROUP BY LOWER(args->>'validator')
+       ) u ON u.validator = v.address
        WHERE v.address != '${ZERO_ADDRESS}'
        ORDER BY ${orderBy}
        LIMIT $1`,
@@ -1069,18 +1064,18 @@ export class Database {
       [address.toLowerCase(), epochCount]
     );
 
-    // Compute running participation_score
+    // Compute running prime_rate (prime count / epochs seen)
     const rows = result.rows;
     let primeTotal = 0;
-    let totalDuties = 0;
-    // Process in epoch-ascending order for running score
+    let totalEpochs = 0;
+    // Process in epoch-ascending order for running rate
     const reversed = [...rows].reverse();
     const scored = reversed.map((r) => {
-      totalDuties++;
+      totalEpochs++;
       if (r.prime_present) primeTotal++;
       return {
         epoch: r.epoch,
-        participation_score: totalDuties > 0 ? parseFloat(((primeTotal / totalDuties) * 100).toFixed(2)) : 100,
+        prime_rate: totalEpochs > 0 ? parseFloat(((primeTotal / totalEpochs) * 100).toFixed(2)) : 100,
         prime_present: r.prime_present,
         slashed: r.slashed,
         status: r.status,
@@ -1264,10 +1259,6 @@ export class Database {
         COALESCE(d.delegated_stake, 0) as delegated_stake,
         COALESCE(d.delegator_count, 0) as delegator_count,
         v.total_stake - COALESCE(d.delegated_stake, 0) as self_stake,
-        CASE WHEN v.prime_count + v.slash_count > 0
-          THEN ROUND(v.prime_count::numeric / (v.prime_count + v.slash_count) * 100, 2)
-          ELSE 100
-        END as participation_score,
         COALESCE(u.uptime_pct, 100) as uptime_percentage,
         -- latest status-changing event timestamp
         (SELECT block_timestamp FROM events
@@ -1320,12 +1311,10 @@ export class Database {
     if (!result.rows[0]) return null;
 
     const row = result.rows[0];
-    // Also compute recent_participation_score_30_epochs from participation history
-    // (prime_count over last 30 epochs vs slash count)
     return {
       ...row,
       latest_primed_epoch: row.last_prime_epoch,
-      recent_participation_score_30_epochs: parseFloat(row.recent_prime_rate_30_epochs),
+      recent_prime_rate_30_epochs: parseFloat(row.recent_prime_rate_30_epochs),
     };
   }
 
@@ -1334,7 +1323,7 @@ export class Database {
   // ============================================================
 
   private static readonly VALIDATOR_SORT_WHITELIST = new Set([
-    "total_stake", "participation_score", "total_rewards", "total_slashed",
+    "total_stake", "total_rewards", "total_slashed",
     "prime_count", "slash_count", "delegated_stake", "uptime_percentage",
   ]);
 
@@ -1368,10 +1357,6 @@ export class Database {
         COALESCE(d.delegated_stake, 0) as delegated_stake,
         COALESCE(d.delegator_count, 0) as delegator_count,
         v.total_stake - COALESCE(d.delegated_stake, 0) as self_stake,
-        CASE WHEN v.prime_count + v.slash_count > 0
-          THEN ROUND(v.prime_count::numeric / (v.prime_count + v.slash_count) * 100, 2)
-          ELSE 100
-        END as participation_score,
         COALESCE(u.uptime_pct, 100) as uptime_percentage
        FROM validators v
        LEFT JOIN (
