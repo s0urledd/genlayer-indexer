@@ -1,13 +1,39 @@
 import {
   createPublicClient,
-  http,
+  custom,
   type Log,
   type AbiEvent,
   decodeEventLog,
+  type EIP1193RequestFn,
 } from "viem";
 import { config } from "./config.js";
 import { STAKING_EVENTS_ABI, SLASHING_EVENTS_ABI, CONSENSUS_EVENTS_ABI, EVENT_CATEGORIES, VOTE_TYPES, TX_STATUSES } from "./abi.js";
 import { Database } from "./db/queries.js";
+
+// Custom transport that always includes jsonrpc + id fields (required by GenLayer RPC)
+let rpcRequestId = 1;
+function genlayerTransport(url: string) {
+  return custom({
+    async request({ method, params }: { method: string; params?: any }) {
+      const body = {
+        jsonrpc: "2.0",
+        id: rpcRequestId++,
+        method,
+        params: params ?? [],
+      };
+      const res = await fetch(url, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(body),
+      });
+      const json = await res.json() as any;
+      if (json.error) {
+        throw new Error(json.error.message || JSON.stringify(json.error));
+      }
+      return json.result;
+    },
+  } as { request: EIP1193RequestFn });
+}
 
 // Build a custom chain definition for GenLayer
 const genlayerChain = {
@@ -42,7 +68,7 @@ export class Indexer {
   constructor(db: Database) {
     this.client = createPublicClient({
       chain: genlayerChain,
-      transport: http(config.rpcUrl),
+      transport: genlayerTransport(config.rpcUrl),
     });
     this.db = db;
   }
