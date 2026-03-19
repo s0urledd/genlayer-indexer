@@ -47,31 +47,9 @@ export class Api {
     this.server.listen(port, () => {
       console.log(`API server listening on http://localhost:${port}`);
       console.log("Available endpoints:");
-      console.log("  GET /health");
-      console.log("  GET /stats");
-      console.log("  GET /stats/summary");
-      console.log("  GET /stats/network-uptime");
-      console.log("  GET /stats/timeline");
-      console.log("  GET /stats/event-activity");
-      console.log("  GET /stats/rpc-latency");
-      console.log("  GET /validators");
-      console.log("  GET /validators/top");
-      console.log("  GET /validators/:address");
-      console.log("  GET /validators/:address/history");
-      console.log("  GET /validators/:address/uptime");
-      console.log("  GET /validators/:address/delegations");
-      console.log("  GET /validators/:address/transactions");
-      console.log("  GET /validators/:address/participation-history");
-      console.log("  GET /validators/:address/reward-history");
-      console.log("  GET /validators/:address/slash-history");
-      console.log("  GET /consensus/stats");
-      console.log("  GET /epochs");
-      console.log("  GET /epochs/:epoch");
-      console.log("  GET /epochs/durations");
-      console.log("  GET /events");
-      console.log("  GET /events/feed");
-      console.log("  GET /events/slashes");
-      console.log("  GET /delegations");
+      for (const key of this.routes.keys()) {
+        console.log(`  ${key}`);
+      }
     });
   }
 
