@@ -168,7 +168,7 @@ export class Api {
     // GET /validators
     // List all validators with sort/order support
     // ?status=active|banned|quarantined|exiting
-    // ?sort=total_stake|participation_score|total_rewards|...
+    // ?sort=total_stake|uptime_percentage|total_rewards|...
     // ?order=asc|desc
     // ?limit=100  ?offset=0
     // ──────────────────────────────────────────────────────────
@@ -184,16 +184,16 @@ export class Api {
 
     // ──────────────────────────────────────────────────────────
     // GET /validators/top
-    // Top N validators by stake, participation, or rewards
-    // ?sort=stake|participation|rewards  (default: stake)
+    // Top N validators by stake, uptime, or rewards
+    // ?sort=stake|uptime|rewards  (default: stake)
     // ?limit=10
     // ──────────────────────────────────────────────────────────
     this.routes.set("GET /validators/top", async (params) => {
       const sortRaw = params.get("sort") || "stake";
-      if (!["stake", "participation", "rewards"].includes(sortRaw)) {
-        throw new ValidationError("Invalid sort: must be one of stake, participation, rewards");
+      if (!["stake", "uptime", "rewards"].includes(sortRaw)) {
+        throw new ValidationError("Invalid sort: must be one of stake, uptime, rewards");
       }
-      const sort = sortRaw as "stake" | "participation" | "rewards";
+      const sort = sortRaw as "stake" | "uptime" | "rewards";
       const limit = parseIntParam(params, "limit", 10);
       return this.db.getTopValidators(sort, limit);
     });
