@@ -334,6 +334,7 @@ export const STAKING_EVENTS_ABI = [
 ] as const;
 
 // Slashing contract events (separate contract address, discovered via staking.getSlashingAddress())
+// Source: genlayer-js npm package v0.36.1 SLASH_ABI
 export const SLASHING_EVENTS_ABI = [
   {
     type: "event",
@@ -343,7 +344,14 @@ export const SLASHING_EVENTS_ABI = [
       { name: "txId", type: "bytes32", indexed: false },
       { name: "epoch", type: "uint256", indexed: false },
       { name: "percentage", type: "uint256", indexed: false },
-      { name: "txStatus", type: "uint8", indexed: false },
+    ],
+  },
+  {
+    type: "event",
+    name: "SlashEnacted",
+    inputs: [
+      { name: "validator", type: "address", indexed: true },
+      { name: "epoch", type: "uint256", indexed: false },
     ],
   },
 ] as const;
@@ -674,6 +682,7 @@ export const EVENT_CATEGORIES: Record<string, string> = {
   SetTransactionFeesManager: "governance",
   SetStakingInvariant: "governance",
   SlashedFromIdleness: "slashing",
+  SlashEnacted: "slashing",
   // Consensus contract events
   NewTransaction: "consensus_tx",
   CreatedTransaction: "consensus_tx",
