@@ -1457,30 +1457,33 @@ export class Database {
       ? params.sort : "total_stake";
     const sortOrder = params.order === "asc" ? "ASC" : "DESC";
 
+    // Wrap in a subquery so ORDER BY on aliased columns is unambiguous
     const result = await this.pool.query(
-      `SELECT v.*,
-        COALESCE(d.delegated_stake, 0) as delegated_stake,
-        COALESCE(d.delegator_count, 0) as delegator_count,
-        v.total_stake - COALESCE(d.delegated_stake, 0) as self_stake,
-        COALESCE(u.uptime_pct, 100) as uptime_percentage
-       FROM validators v
-       LEFT JOIN (
-         SELECT validator_address,
-           SUM(total_deposited - total_withdrawn) as delegated_stake,
-           COUNT(*) FILTER (WHERE total_deposited > total_withdrawn) as delegator_count
-         FROM delegations GROUP BY validator_address
-       ) d ON d.validator_address = v.address
-       LEFT JOIN (
-         SELECT args->>'validator' as validator,
-           ROUND(COUNT(*)::numeric / GREATEST(
-             (SELECT COUNT(*) FROM (SELECT 1 FROM epochs ORDER BY epoch DESC LIMIT 30) _e), 1
-           ) * 100, 2) as uptime_pct
-         FROM events
-         WHERE event_name = 'ValidatorPrime'
-           AND (args->>'epoch')::bigint >= COALESCE((SELECT MAX(epoch) - 29 FROM epochs), 0)
-         GROUP BY args->>'validator'
-       ) u ON u.validator = v.address
-       ${where}
+      `SELECT * FROM (
+        SELECT v.*,
+          COALESCE(d.delegated_stake, 0) as delegated_stake,
+          COALESCE(d.delegator_count, 0) as delegator_count,
+          v.total_stake - COALESCE(d.delegated_stake, 0) as self_stake,
+          COALESCE(u.uptime_pct, 100) as uptime_percentage
+         FROM validators v
+         LEFT JOIN (
+           SELECT validator_address,
+             SUM(total_deposited - total_withdrawn) as delegated_stake,
+             COUNT(*) FILTER (WHERE total_deposited > total_withdrawn) as delegator_count
+           FROM delegations GROUP BY validator_address
+         ) d ON d.validator_address = v.address
+         LEFT JOIN (
+           SELECT args->>'validator' as validator,
+             ROUND(COUNT(*)::numeric / GREATEST(
+               (SELECT COUNT(*) FROM (SELECT 1 FROM epochs ORDER BY epoch DESC LIMIT 30) _e), 1
+             ) * 100, 2) as uptime_pct
+           FROM events
+           WHERE event_name = 'ValidatorPrime'
+             AND (args->>'epoch')::bigint >= COALESCE((SELECT MAX(epoch) - 29 FROM epochs), 0)
+           GROUP BY args->>'validator'
+         ) u ON u.validator = v.address
+         ${where}
+       ) sub
        ORDER BY ${sortField} ${sortOrder}
        LIMIT $${paramIndex++} OFFSET $${paramIndex++}`,
       [...values, limit, offset]
