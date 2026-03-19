@@ -156,6 +156,14 @@ export class Api {
       return this.indexer.getLatencyStats();
     });
 
+    // ──────────────────────────────────────────────────────────
+    // GET /stats/network-latency
+    // Real on-chain latency: block time, tx finality, epoch duration
+    // ──────────────────────────────────────────────────────────
+    this.routes.set("GET /stats/network-latency", async () => {
+      return this.db.getNetworkLatency();
+    });
+
     // Keep old name as alias
     this.routes.set("GET /stats/latency", async () => {
       if (!this.indexer) {

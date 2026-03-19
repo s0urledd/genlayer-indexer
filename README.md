@@ -72,6 +72,7 @@ Which endpoints to use for each page:
 | Network uptime chart | `GET /stats/network-uptime?epochs=30` | Chart-ready array |
 | Event activity chart | `GET /stats/event-activity?hours=24` | Hourly breakdown by category |
 | Metrics timeline | `GET /stats/timeline?hours=24` | Time-series: validators, staked, epoch |
+| Network latency | `GET /stats/network-latency` | Block time, tx finality, epoch duration (avg/p50/p95) |
 
 ### Validators List Page
 
@@ -110,6 +111,7 @@ All endpoints return JSON. Default port: `3000`.
 | `GET /stats/timeline` | Historical metrics time-series |
 | `GET /stats/event-activity` | Event counts by hour and category |
 | `GET /stats/rpc-latency` | RPC ping latency + log fetch duration (avg, p50, p95) |
+| `GET /stats/network-latency` | On-chain latency: block time, tx finality, epoch duration (avg, p50, p95) |
 
 > `/stats/throughput` and `/stats/latency` are kept as aliases for backward compatibility.
 
