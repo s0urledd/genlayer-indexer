@@ -190,7 +190,7 @@ export class Database {
       [
         address.toLowerCase(),
         data.operator?.toLowerCase() || null,
-        data.status || 'active',
+        data.status || null,
         data.totalStake || null,
         data.totalRewards || null,
         data.totalSlashed || null,

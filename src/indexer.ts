@@ -572,6 +572,8 @@ export class Indexer {
     }
   }
 
+  private static readonly ZERO_ADDRESS = "0x0000000000000000000000000000000000000000";
+
   private async processEvent(event: {
     blockNumber: bigint;
     eventName: string;
@@ -579,6 +581,12 @@ export class Indexer {
     blockTimestamp?: Date;
   }) {
     const { eventName, args, blockNumber } = event;
+
+    // Skip events targeting the zero address — these are artefacts, not real validators
+    const eventValidator = args.validator as string | undefined;
+    if (eventValidator && eventValidator.toLowerCase() === Indexer.ZERO_ADDRESS) {
+      return;
+    }
 
     switch (eventName) {
       case "ValidatorJoin": {
