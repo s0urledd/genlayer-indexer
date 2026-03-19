@@ -10,7 +10,12 @@ import { config } from "./config.js";
 import { STAKING_EVENTS_ABI, SLASHING_EVENTS_ABI, CONSENSUS_EVENTS_ABI, EVENT_CATEGORIES, VOTE_TYPES, TX_STATUSES } from "./abi.js";
 import { Database } from "./db/queries.js";
 
+// RPC timeout (ms) — contract reads with large return data need more time
+const RPC_TIMEOUT_MS = 30_000;
+const RPC_MAX_RETRIES = 3;
+
 // Custom transport that always includes jsonrpc + id fields (required by GenLayer RPC)
+// Includes timeout + retry with exponential backoff
 let rpcRequestId = 1;
 function genlayerTransport(url: string) {
   return custom({
@@ -21,16 +26,38 @@ function genlayerTransport(url: string) {
         method,
         params: params ?? [],
       };
-      const res = await fetch(url, {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify(body),
-      });
-      const json = await res.json() as any;
-      if (json.error) {
-        throw new Error(json.error.message || JSON.stringify(json.error));
+
+      let lastError: Error | null = null;
+      for (let attempt = 0; attempt <= RPC_MAX_RETRIES; attempt++) {
+        if (attempt > 0) {
+          const delay = Math.min(1000 * 2 ** attempt, 8000);
+          await new Promise(r => setTimeout(r, delay));
+        }
+        try {
+          const controller = new AbortController();
+          const timeout = setTimeout(() => controller.abort(), RPC_TIMEOUT_MS);
+          const res = await fetch(url, {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify(body),
+            signal: controller.signal,
+          });
+          clearTimeout(timeout);
+          const json = await res.json() as any;
+          if (json.error) {
+            throw new Error(json.error.message || JSON.stringify(json.error));
+          }
+          return json.result;
+        } catch (err: any) {
+          lastError = err;
+          if (err.name === "AbortError") {
+            console.warn(`[RPC] Timeout (${RPC_TIMEOUT_MS}ms) on ${method} — attempt ${attempt + 1}/${RPC_MAX_RETRIES + 1}`);
+          } else if (attempt < RPC_MAX_RETRIES) {
+            console.warn(`[RPC] ${method} failed — attempt ${attempt + 1}/${RPC_MAX_RETRIES + 1}: ${err.message}`);
+          }
+        }
       }
-      return json.result;
+      throw lastError || new Error(`RPC ${method} failed after ${RPC_MAX_RETRIES + 1} attempts`);
     },
   } as { request: EIP1193RequestFn });
 }
@@ -227,11 +254,11 @@ export class Indexer {
       bannedValidators = new Set(
         (bannedResult as unknown as Array<{ validator: string }>).map(b => b.validator.toLowerCase())
       );
-    } catch {
-      // getAllBannedValidators may not be available on all versions
+    } catch (err: any) {
+      console.warn("[Sync] getAllBannedValidators failed:", err.message?.slice(0, 120));
     }
 
-    // Fetch active weights (parallel with status updates)
+    // Fetch active weights
     let activeWeights: bigint[] = [];
     try {
       const weightsResult = await this.client.readContract({
@@ -244,8 +271,9 @@ export class Indexer {
         functionName: "activeWeights",
       });
       activeWeights = weightsResult as bigint[];
-    } catch {
-      // activeWeights may not be available
+      console.log(`[Sync] Fetched ${activeWeights.length} weights, non-zero: ${activeWeights.filter(w => w > 0n).length}`);
+    } catch (err: any) {
+      console.error("[Sync] activeWeights() FAILED:", err.message?.slice(0, 120));
     }
 
     // Update validator statuses and weights in DB
@@ -278,10 +306,16 @@ export class Indexer {
       }
     }
 
-    // Sync live stake data from validatorView() for each active validator already in our DB
+    console.log(`[Sync] Status: ${activeValidators.size} active, ${quarantinedValidators.size} quarantined, ${bannedValidators.size} banned | weights: ${activeWeights.length}`);
+
+    // Sync live stake data + delegator counts for each active validator in our DB
+    let syncedCount = 0;
+    let failedCount = 0;
     for (const addr of activeList) {
       const existingValidator = await this.db.getValidator(addr);
       if (!existingValidator) continue;
+
+      // validatorView — live stake data
       try {
         const viewResult = await this.client.readContract({
           address: stakingAddr,
@@ -312,15 +346,13 @@ export class Indexer {
           totalShares: view.shares.toString(),
           delegatedStake: view.delegatedStake.toString(),
         });
-      } catch {
-        // validatorView may fail for some validators
+        syncedCount++;
+      } catch (err: any) {
+        failedCount++;
+        console.warn(`[Sync] validatorView(${addr.slice(0, 10)}...) failed: ${err.message?.slice(0, 80)}`);
       }
-    }
 
-    // Sync delegator counts per validator (only for validators already in our DB)
-    for (const addr of activeList) {
-      const existsForDelegator = await this.db.getValidator(addr);
-      if (!existsForDelegator) continue;
+      // delegatorCount
       try {
         const countResult = await this.client.readContract({
           address: stakingAddr,
@@ -334,9 +366,12 @@ export class Indexer {
           args: [addr as `0x${string}`],
         });
         await this.db.updateValidatorDelegatorCount(addr, Number(countResult));
-      } catch {
-        // May not be available
+      } catch (err: any) {
+        console.warn(`[Sync] delegatorCount(${addr.slice(0, 10)}...) failed: ${err.message?.slice(0, 80)}`);
       }
+    }
+    if (syncedCount > 0 || failedCount > 0) {
+      console.log(`[Sync] validatorView: ${syncedCount} synced, ${failedCount} failed out of ${activeList.length} active`);
     }
 
     // Sync epoch details
@@ -356,6 +391,7 @@ export class Indexer {
         functionName: "epoch",
       });
       const epochNum = currentEpoch as bigint;
+      console.log(`[Sync] Current on-chain epoch: ${epochNum}`);
 
       // Contract uses alternating storage slots: epochEven for even epochs, epochOdd for odd.
       // Sync BOTH slots to capture current and previous epoch data before they get overwritten.
@@ -405,12 +441,12 @@ export class Indexer {
             totalStakeWithdrawn: data.stakeWithdrawal.toString(),
             totalSlashed: data.slashed.toString(),
           });
-        } catch {
-          // Individual epoch slot read may fail
+        } catch (err: any) {
+          console.warn(`[Sync] ${slot.fnName}() (epoch ${slot.epochNum}) failed: ${err.message?.slice(0, 100)}`);
         }
       }
-    } catch {
-      // Epoch sync is best-effort
+    } catch (err: any) {
+      console.error("[Sync] Epoch sync failed:", err.message?.slice(0, 120));
     }
   }
 
