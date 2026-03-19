@@ -849,6 +849,7 @@ export class Indexer {
         await this.db.upsertConsensusTx(txId, {
           status: "finalized",
           finalizedAtBlock: blockNumber,
+          finalizedAtTimestamp: event.blockTimestamp,
         });
         break;
       }
