@@ -255,7 +255,7 @@ All settings via `.env`:
 
 | Variable | Default | Description |
 |----------|---------|-------------|
-| `RPC_URL` | `https://zksync-os-testnet-genlayer.zksync.dev` | GenLayer chain RPC |
+| `RPC_URL` | `http://34.91.102.53:9151` | GenLayer chain RPC |
 | `STAKING_CONTRACT` | `0x4A4449E617F8D10FDeD0b461CadEf83939E821A5` | Staking contract address |
 | `CONSENSUS_CONTRACT` | `0x0112Bf6e83497965A5fdD6Dad1E447a6E004271D` | ConsensusMain contract address |
 | `SLASHING_CONTRACT` | *(empty)* | Slashing contract address (from `staking.getSlashingAddress()`) |
