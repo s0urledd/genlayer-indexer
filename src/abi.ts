@@ -623,7 +623,7 @@ export const TX_STATUSES: Record<number, string> = {
   5: "ACCEPTED",
   6: "UNDETERMINED",
   7: "FINALIZED",
-  8: "CANCELED",
+  8: "CANCELLED",
   9: "APPEAL_REVEALING",
   10: "APPEAL_COMMITTING",
   11: "VALIDATORS_TIMEOUT",

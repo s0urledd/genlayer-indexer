@@ -619,7 +619,7 @@ export class Database {
         COALESCE(d.delegated_stake, 0) as delegated_stake,
         COALESCE(d.delegator_count, 0) as delegator_count,
         v.total_stake - COALESCE(d.delegated_stake, 0) as self_stake,
-        COALESCE(u.uptime_pct, 100) as uptime_percentage
+        COALESCE(u.uptime_pct, 0) as uptime_percentage
        FROM validators v
        LEFT JOIN (
          SELECT validator_address,
@@ -636,7 +636,7 @@ export class Database {
          FROM events
          WHERE event_name = 'ValidatorPrime'
            AND (args->>'epoch')::bigint >= COALESCE(
-             (SELECT MAX(epoch) - 29 FROM epochs), 0
+             (SELECT MIN(epoch) FROM (SELECT epoch FROM epochs ORDER BY epoch DESC LIMIT 30) _recent), 0
            )
          GROUP BY LOWER(args->>'validator')
        ) u ON u.validator = v.address
@@ -843,9 +843,8 @@ export class Database {
           AND (args->>'epoch')::bigint = e1.epoch
          ) as prime_count,
          (SELECT COUNT(*) FROM events
-          WHERE category = 'slashing'
-          AND block_number >= COALESCE(e2.advanced_at_block, 0)
-          AND block_number < e1.advanced_at_block
+          WHERE event_name IN ('ValidatorSlash', 'SlashedFromIdleness', 'SlashEnacted')
+          AND (args->>'epoch')::bigint = e1.epoch
          ) as slash_count_in_epoch
        FROM epochs e1
        LEFT JOIN epochs e2 ON e2.epoch = e1.epoch - 1
@@ -1116,7 +1115,7 @@ export class Database {
         COALESCE(d.delegated_stake, 0) as delegated_stake,
         COALESCE(d.delegator_count, 0) as delegator_count,
         v.total_stake - COALESCE(d.delegated_stake, 0) as self_stake,
-        COALESCE(u.uptime_pct, 100) as uptime_percentage
+        COALESCE(u.uptime_pct, 0) as uptime_percentage
        FROM validators v
        LEFT JOIN (
          SELECT validator_address,
@@ -1364,7 +1363,7 @@ export class Database {
         COALESCE(d.delegated_stake, 0) as delegated_stake,
         COALESCE(d.delegator_count, 0) as delegator_count,
         v.total_stake - COALESCE(d.delegated_stake, 0) as self_stake,
-        COALESCE(u.uptime_pct, 100) as uptime_percentage,
+        COALESCE(u.uptime_pct, 0) as uptime_percentage,
         -- latest status-changing event timestamp
         (SELECT block_timestamp FROM events
          WHERE LOWER(args->>'validator') = $1
@@ -1464,7 +1463,7 @@ export class Database {
           COALESCE(d.delegated_stake, 0) as delegated_stake,
           COALESCE(d.delegator_count, 0) as delegator_count,
           v.total_stake - COALESCE(d.delegated_stake, 0) as self_stake,
-          COALESCE(u.uptime_pct, 100) as uptime_percentage
+          COALESCE(u.uptime_pct, 0) as uptime_percentage
          FROM validators v
          LEFT JOIN (
            SELECT validator_address,
