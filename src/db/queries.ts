@@ -632,28 +632,38 @@ export class Database {
          GROUP BY validator_address
        ) d ON d.validator_address = v.address
        LEFT JOIN LATERAL (
-         SELECT ROUND(
-           COUNT(DISTINCT (ev.args->>'epoch'))::numeric /
-           GREATEST(
-             (SELECT COUNT(*) FROM epochs
-              WHERE advanced_at_block IS NOT NULL
-                AND advanced_at_block >= COALESCE(v.joined_at_block, 0)
-                AND epoch >= COALESCE(
-                  (SELECT MIN(epoch) FROM (
-                    SELECT epoch FROM epochs WHERE advanced_at_block IS NOT NULL ORDER BY epoch DESC LIMIT 30
-                  ) _r), 0
-                )
-             ), 1
-           ) * 100, 2
-         ) as uptime_pct
-         FROM events ev
-         WHERE ev.event_name = 'ValidatorPrime'
-           AND LOWER(ev.args->>'validator') = v.address
-           AND (ev.args->>'epoch')::bigint >= COALESCE(
-             (SELECT MIN(epoch) FROM (
-               SELECT epoch FROM epochs WHERE advanced_at_block IS NOT NULL ORDER BY epoch DESC LIMIT 30
-             ) _recent), 0
-           )
+         -- Uptime = prime count / eligible epoch count (last 30 finalized)
+         -- +2 activation rule: validator can participate from join_epoch + 2
+         SELECT CASE WHEN eligible.cnt > 0
+           THEN ROUND(COALESCE(primed.cnt, 0)::numeric / eligible.cnt * 100, 2)
+           ELSE 0
+         END as uptime_pct
+         FROM (
+           SELECT COUNT(*) as cnt FROM epochs
+           WHERE finalized_at_block IS NOT NULL
+             AND advanced_at_block >= COALESCE(v.joined_at_block, 0)
+             AND epoch >= COALESCE(
+               (SELECT epoch FROM epochs WHERE advanced_at_block IS NOT NULL
+                AND advanced_at_block <= COALESCE(v.joined_at_block, 0)
+                ORDER BY epoch DESC LIMIT 1), 0
+             ) + 2
+             AND epoch >= COALESCE(
+               (SELECT MIN(epoch) FROM (
+                 SELECT epoch FROM epochs WHERE finalized_at_block IS NOT NULL ORDER BY epoch DESC LIMIT 30
+               ) _r), 0
+             )
+         ) eligible,
+         (
+           SELECT COUNT(DISTINCT (ev.args->>'epoch')) as cnt
+           FROM events ev
+           WHERE ev.event_name = 'ValidatorPrime'
+             AND LOWER(ev.args->>'validator') = v.address
+             AND (ev.args->>'epoch')::bigint >= COALESCE(
+               (SELECT MIN(epoch) FROM (
+                 SELECT epoch FROM epochs WHERE finalized_at_block IS NOT NULL ORDER BY epoch DESC LIMIT 30
+               ) _recent), 0
+             )
+         ) primed
        ) u ON true
        ${where}
        ORDER BY v.total_stake DESC
@@ -761,23 +771,33 @@ export class Database {
         (SELECT COUNT(*) FROM events WHERE block_timestamp > NOW() - INTERVAL '24 hours') as events_last_24h,
         (SELECT COUNT(*) FROM delegations) as total_delegations,
         (SELECT COALESCE(SUM(total_deposited - total_withdrawn), 0) FROM delegations) as total_delegated,
-        -- Estimated APY: total rewards distributed / total staked, annualized from first epoch to now
+        -- Estimated APY from epoch inflation data
+        -- Uses total inflation per epoch / epoch duration, annualized
+        -- Falls back to ValidatorPrime reward sums if inflation data unavailable
         (SELECT CASE
-          WHEN COALESCE(SUM(v.total_stake), 0) > 0
-            AND first_epoch.ts IS NOT NULL
-            AND EXTRACT(EPOCH FROM NOW() - first_epoch.ts) > 3600
+          WHEN ep_stats.epoch_count > 0 AND ep_stats.avg_inflation > 0 AND ep_stats.total_staked > 0
           THEN LEAST(
             ROUND(
-              COALESCE(SUM(v.total_rewards), 0)::numeric / GREATEST(SUM(v.total_stake), 1) *
-              (365.25 * 86400.0 / EXTRACT(EPOCH FROM NOW() - first_epoch.ts)) * 100, 2
+              (ep_stats.avg_inflation * 365.0 / GREATEST(ep_stats.avg_duration_days, 0.01))
+              / ep_stats.total_staked * 100, 2
             ),
             9999.99
           )
           ELSE 0
         END
-        FROM validators v,
-        (SELECT MIN(advanced_at_timestamp) as ts FROM epochs WHERE advanced_at_timestamp IS NOT NULL) first_epoch
-        WHERE v.address != '${zeroAddr}'
+        FROM (
+          SELECT
+            COUNT(*) as epoch_count,
+            AVG(e.inflation_amount) as avg_inflation,
+            AVG(EXTRACT(EPOCH FROM e.advanced_at_timestamp - prev_e.advanced_at_timestamp) / 86400.0) as avg_duration_days,
+            (SELECT COALESCE(SUM(total_stake), 0) FROM validators WHERE address != '${zeroAddr}') as total_staked
+          FROM epochs e
+          INNER JOIN epochs prev_e ON prev_e.epoch = e.epoch - 1
+          WHERE e.inflation_amount IS NOT NULL
+            AND e.inflation_amount > 0
+            AND e.advanced_at_timestamp IS NOT NULL
+            AND prev_e.advanced_at_timestamp IS NOT NULL
+        ) ep_stats
         ) as estimated_apy
     `);
     return result.rows[0];
@@ -1127,28 +1147,38 @@ export class Database {
          FROM delegations GROUP BY validator_address
        ) d ON d.validator_address = v.address
        LEFT JOIN LATERAL (
-         SELECT ROUND(
-           COUNT(DISTINCT (ev.args->>'epoch'))::numeric /
-           GREATEST(
-             (SELECT COUNT(*) FROM epochs
-              WHERE advanced_at_block IS NOT NULL
-                AND advanced_at_block >= COALESCE(v.joined_at_block, 0)
-                AND epoch >= COALESCE(
-                  (SELECT MIN(epoch) FROM (
-                    SELECT epoch FROM epochs WHERE advanced_at_block IS NOT NULL ORDER BY epoch DESC LIMIT 30
-                  ) _r), 0
-                )
-             ), 1
-           ) * 100, 2
-         ) as uptime_pct
-         FROM events ev
-         WHERE ev.event_name = 'ValidatorPrime'
-           AND LOWER(ev.args->>'validator') = v.address
-           AND (ev.args->>'epoch')::bigint >= COALESCE(
-             (SELECT MIN(epoch) FROM (
-               SELECT epoch FROM epochs WHERE advanced_at_block IS NOT NULL ORDER BY epoch DESC LIMIT 30
-             ) _recent), 0
-           )
+         -- Uptime = prime count / eligible epoch count (last 30 finalized)
+         -- +2 activation rule: validator participates from join_epoch + 2
+         SELECT CASE WHEN eligible.cnt > 0
+           THEN ROUND(COALESCE(primed.cnt, 0)::numeric / eligible.cnt * 100, 2)
+           ELSE 0
+         END as uptime_pct
+         FROM (
+           SELECT COUNT(*) as cnt FROM epochs
+           WHERE finalized_at_block IS NOT NULL
+             AND advanced_at_block >= COALESCE(v.joined_at_block, 0)
+             AND epoch >= COALESCE(
+               (SELECT epoch FROM epochs WHERE advanced_at_block IS NOT NULL
+                AND advanced_at_block <= COALESCE(v.joined_at_block, 0)
+                ORDER BY epoch DESC LIMIT 1), 0
+             ) + 2
+             AND epoch >= COALESCE(
+               (SELECT MIN(epoch) FROM (
+                 SELECT epoch FROM epochs WHERE finalized_at_block IS NOT NULL ORDER BY epoch DESC LIMIT 30
+               ) _r), 0
+             )
+         ) eligible,
+         (
+           SELECT COUNT(DISTINCT (ev.args->>'epoch')) as cnt
+           FROM events ev
+           WHERE ev.event_name = 'ValidatorPrime'
+             AND LOWER(ev.args->>'validator') = v.address
+             AND (ev.args->>'epoch')::bigint >= COALESCE(
+               (SELECT MIN(epoch) FROM (
+                 SELECT epoch FROM epochs WHERE finalized_at_block IS NOT NULL ORDER BY epoch DESC LIMIT 30
+               ) _recent), 0
+             )
+         ) primed
        ) u ON true
        WHERE v.address != '${ZERO_ADDRESS}'
        ORDER BY ${orderBy}
@@ -1416,28 +1446,38 @@ export class Database {
          FROM delegations GROUP BY validator_address
        ) d ON d.validator_address = v.address
        LEFT JOIN LATERAL (
-         SELECT ROUND(
-           COUNT(DISTINCT (ev.args->>'epoch'))::numeric /
-           GREATEST(
-             (SELECT COUNT(*) FROM epochs
-              WHERE advanced_at_block IS NOT NULL
-                AND advanced_at_block >= COALESCE(v.joined_at_block, 0)
-                AND epoch >= COALESCE(
-                  (SELECT MIN(epoch) FROM (
-                    SELECT epoch FROM epochs WHERE advanced_at_block IS NOT NULL ORDER BY epoch DESC LIMIT 30
-                  ) _r), 0
-                )
-             ), 1
-           ) * 100, 2
-         ) as uptime_pct
-         FROM events ev
-         WHERE ev.event_name = 'ValidatorPrime'
-           AND LOWER(ev.args->>'validator') = v.address
-           AND (ev.args->>'epoch')::bigint >= COALESCE(
-             (SELECT MIN(epoch) FROM (
-               SELECT epoch FROM epochs WHERE advanced_at_block IS NOT NULL ORDER BY epoch DESC LIMIT 30
-             ) _recent), 0
-           )
+         -- Uptime = prime count / eligible epoch count (last 30 finalized)
+         -- +2 activation rule: validator participates from join_epoch + 2
+         SELECT CASE WHEN eligible.cnt > 0
+           THEN ROUND(COALESCE(primed.cnt, 0)::numeric / eligible.cnt * 100, 2)
+           ELSE 0
+         END as uptime_pct
+         FROM (
+           SELECT COUNT(*) as cnt FROM epochs
+           WHERE finalized_at_block IS NOT NULL
+             AND advanced_at_block >= COALESCE(v.joined_at_block, 0)
+             AND epoch >= COALESCE(
+               (SELECT epoch FROM epochs WHERE advanced_at_block IS NOT NULL
+                AND advanced_at_block <= COALESCE(v.joined_at_block, 0)
+                ORDER BY epoch DESC LIMIT 1), 0
+             ) + 2
+             AND epoch >= COALESCE(
+               (SELECT MIN(epoch) FROM (
+                 SELECT epoch FROM epochs WHERE finalized_at_block IS NOT NULL ORDER BY epoch DESC LIMIT 30
+               ) _r), 0
+             )
+         ) eligible,
+         (
+           SELECT COUNT(DISTINCT (ev.args->>'epoch')) as cnt
+           FROM events ev
+           WHERE ev.event_name = 'ValidatorPrime'
+             AND LOWER(ev.args->>'validator') = v.address
+             AND (ev.args->>'epoch')::bigint >= COALESCE(
+               (SELECT MIN(epoch) FROM (
+                 SELECT epoch FROM epochs WHERE finalized_at_block IS NOT NULL ORDER BY epoch DESC LIMIT 30
+               ) _recent), 0
+             )
+         ) primed
        ) u ON true
        WHERE v.address = $1`,
       [addr]
