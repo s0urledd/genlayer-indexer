@@ -156,6 +156,7 @@ DO $$ BEGIN
   ALTER TABLE delegations ADD COLUMN IF NOT EXISTS current_shares NUMERIC NOT NULL DEFAULT 0;
   ALTER TABLE delegations ADD COLUMN IF NOT EXISTS current_stake NUMERIC NOT NULL DEFAULT 0;
   ALTER TABLE consensus_transactions ADD COLUMN IF NOT EXISTS finalized_at_timestamp TIMESTAMPTZ;
+  ALTER TABLE consensus_transactions ADD COLUMN IF NOT EXISTS accepted_at_timestamp TIMESTAMPTZ;
 EXCEPTION WHEN others THEN NULL;
 END $$;
 

@@ -388,12 +388,13 @@ export class Database {
     createdAtBlock: bigint;
     createdAtTimestamp: Date;
     acceptedAtBlock: bigint;
+    acceptedAtTimestamp: Date;
     finalizedAtBlock: bigint;
     finalizedAtTimestamp: Date;
   }>) {
     await this.pool.query(
-      `INSERT INTO consensus_transactions (tx_id, recipient, activator, leader, status, vote_type, result_type, rotation_count, appeal_count, validators, created_at_block, created_at_timestamp, accepted_at_block, finalized_at_block, finalized_at_timestamp, updated_at)
-       VALUES ($1, $2, $3, $4, COALESCE($5, 'pending'), $6, $7, COALESCE($8, 0), COALESCE($9, 0), $10, $11, $12, $13, $14, $15, NOW())
+      `INSERT INTO consensus_transactions (tx_id, recipient, activator, leader, status, vote_type, result_type, rotation_count, appeal_count, validators, created_at_block, created_at_timestamp, accepted_at_block, accepted_at_timestamp, finalized_at_block, finalized_at_timestamp, updated_at)
+       VALUES ($1, $2, $3, $4, COALESCE($5, 'pending'), $6, $7, COALESCE($8, 0), COALESCE($9, 0), $10, $11, $12, $13, $14, $15, $16, NOW())
        ON CONFLICT (tx_id) DO UPDATE SET
          recipient = COALESCE($2, consensus_transactions.recipient),
          activator = COALESCE($3, consensus_transactions.activator),
@@ -407,8 +408,9 @@ export class Database {
          created_at_block = COALESCE($11, consensus_transactions.created_at_block),
          created_at_timestamp = COALESCE($12, consensus_transactions.created_at_timestamp),
          accepted_at_block = COALESCE($13, consensus_transactions.accepted_at_block),
-         finalized_at_block = COALESCE($14, consensus_transactions.finalized_at_block),
-         finalized_at_timestamp = COALESCE($15, consensus_transactions.finalized_at_timestamp),
+         accepted_at_timestamp = COALESCE($14, consensus_transactions.accepted_at_timestamp),
+         finalized_at_block = COALESCE($15, consensus_transactions.finalized_at_block),
+         finalized_at_timestamp = COALESCE($16, consensus_transactions.finalized_at_timestamp),
          updated_at = NOW()`,
       [
         txId,
@@ -424,6 +426,7 @@ export class Database {
         data.createdAtBlock?.toString() || null,
         data.createdAtTimestamp || null,
         data.acceptedAtBlock?.toString() || null,
+        data.acceptedAtTimestamp || null,
         data.finalizedAtBlock?.toString() || null,
         data.finalizedAtTimestamp || null,
       ]
@@ -835,7 +838,7 @@ export class Database {
   }
 
   async getEpochDurations(limit = 50) {
-    // Calculate epoch duration from advanced_at_block differences
+    // Calculate epoch duration using LAG (handles genesis epoch 0→2 skip)
     const result = await this.pool.query(
       `SELECT
          e1.epoch,
@@ -843,10 +846,10 @@ export class Database {
          e1.finalized_at_block,
          e1.inflation_amount,
          e1.validator_count,
-         CASE WHEN e2.advanced_at_block IS NOT NULL
-           THEN e1.advanced_at_block - e2.advanced_at_block
-           ELSE NULL
-         END as block_duration,
+         e1.advanced_at_block - LAG(e1.advanced_at_block) OVER (ORDER BY e1.epoch) as block_duration,
+         ROUND(EXTRACT(EPOCH FROM
+           e1.advanced_at_timestamp - LAG(e1.advanced_at_timestamp) OVER (ORDER BY e1.epoch)
+         )::numeric, 0) as duration_seconds,
          (SELECT COUNT(DISTINCT LOWER(args->>'validator')) FROM events
           WHERE event_name = 'ValidatorPrime'
           AND (args->>'epoch')::bigint = e1.epoch
@@ -856,7 +859,7 @@ export class Database {
           AND (args->>'epoch')::bigint = e1.epoch
          ) as slash_count_in_epoch
        FROM epochs e1
-       LEFT JOIN epochs e2 ON e2.epoch = e1.epoch - 1
+       WHERE e1.advanced_at_block IS NOT NULL
        ORDER BY e1.epoch DESC
        LIMIT $1`,
       [limit]
@@ -933,91 +936,16 @@ export class Database {
   }
 
   // ============================================================
-  // Network Latency (real on-chain metrics, not indexer RPC)
+  // Network Latency — GenLayer consensus timing metrics
+  // GenLayer is an L2 on ZKSync; L1 block time is irrelevant.
+  // We measure the actual Optimistic Democracy consensus stages:
+  //   1. Consensus round: Created → Accepted (validator agreement time)
+  //   2. Finalization: Accepted → Finalized (finality window)
+  //   3. End-to-end: Created → Finalized (total user-facing latency)
+  //   4. Epoch duration: time between epoch advances (~1 day target)
   // ============================================================
 
   async getNetworkLatency() {
-    // 1. Block time — use actual block_number gaps to avoid skipping empty blocks
-    //    Takes consecutive event-bearing blocks, divides timestamp diff by block_number diff
-    const blockTimeResult = await this.pool.query(`
-      WITH recent_blocks AS (
-        SELECT block_number, block_timestamp,
-          LAG(block_number) OVER (ORDER BY block_number) as prev_block,
-          LAG(block_timestamp) OVER (ORDER BY block_number) as prev_timestamp
-        FROM (
-          SELECT DISTINCT ON (block_number) block_number, block_timestamp
-          FROM events
-          WHERE block_timestamp IS NOT NULL
-          ORDER BY block_number DESC, id DESC
-          LIMIT 201
-        ) sub
-        ORDER BY block_number
-      ),
-      diffs AS (
-        SELECT
-          EXTRACT(EPOCH FROM block_timestamp - prev_timestamp)
-            / NULLIF(block_number - prev_block, 0) as diff_seconds
-        FROM recent_blocks
-        WHERE prev_timestamp IS NOT NULL
-          AND block_timestamp > prev_timestamp
-          AND block_number > prev_block
-      )
-      SELECT
-        ROUND(AVG(diff_seconds)::numeric, 2) as avg_seconds,
-        ROUND(PERCENTILE_CONT(0.5) WITHIN GROUP (ORDER BY diff_seconds)::numeric, 2) as p50_seconds,
-        ROUND(PERCENTILE_CONT(0.95) WITHIN GROUP (ORDER BY diff_seconds)::numeric, 2) as p95_seconds,
-        ROUND(MIN(diff_seconds)::numeric, 2) as min_seconds,
-        ROUND(MAX(diff_seconds)::numeric, 2) as max_seconds,
-        COUNT(*) as sample_count
-      FROM diffs
-    `);
-
-    // 2. Tx finality — time from created_at to finalized_at (using stored timestamps)
-    const txFinalityResult = await this.pool.query(`
-      WITH finalized AS (
-        SELECT
-          EXTRACT(EPOCH FROM ct.finalized_at_timestamp - ct.created_at_timestamp) as finality_seconds
-        FROM consensus_transactions ct
-        WHERE ct.finalized_at_timestamp IS NOT NULL
-          AND ct.created_at_timestamp IS NOT NULL
-        ORDER BY ct.finalized_at_block DESC
-        LIMIT 100
-      )
-      SELECT
-        ROUND(AVG(finality_seconds)::numeric, 2) as avg_seconds,
-        ROUND(PERCENTILE_CONT(0.5) WITHIN GROUP (ORDER BY finality_seconds)::numeric, 2) as p50_seconds,
-        ROUND(PERCENTILE_CONT(0.95) WITHIN GROUP (ORDER BY finality_seconds)::numeric, 2) as p95_seconds,
-        ROUND(MIN(finality_seconds)::numeric, 2) as min_seconds,
-        ROUND(MAX(finality_seconds)::numeric, 2) as max_seconds,
-        COUNT(*) as sample_count
-      FROM finalized
-      WHERE finality_seconds > 0
-    `);
-
-    // 3. Epoch duration — from epoch timestamps
-    const epochDurationResult = await this.pool.query(`
-      WITH epoch_diffs AS (
-        SELECT
-          e1.epoch,
-          EXTRACT(EPOCH FROM e1.advanced_at_timestamp - e2.advanced_at_timestamp) as duration_seconds
-        FROM epochs e1
-        INNER JOIN epochs e2 ON e2.epoch = e1.epoch - 1
-        WHERE e1.advanced_at_timestamp IS NOT NULL
-          AND e2.advanced_at_timestamp IS NOT NULL
-        ORDER BY e1.epoch DESC
-        LIMIT 30
-      )
-      SELECT
-        ROUND(AVG(duration_seconds)::numeric, 2) as avg_seconds,
-        ROUND(PERCENTILE_CONT(0.5) WITHIN GROUP (ORDER BY duration_seconds)::numeric, 2) as p50_seconds,
-        ROUND(PERCENTILE_CONT(0.95) WITHIN GROUP (ORDER BY duration_seconds)::numeric, 2) as p95_seconds,
-        ROUND(MIN(duration_seconds)::numeric, 2) as min_seconds,
-        ROUND(MAX(duration_seconds)::numeric, 2) as max_seconds,
-        COUNT(*) as sample_count
-      FROM epoch_diffs
-      WHERE duration_seconds > 0
-    `);
-
     const parse = (row: Record<string, string | null>) => ({
       avg_seconds: row.avg_seconds ? parseFloat(row.avg_seconds) : null,
       p50_seconds: row.p50_seconds ? parseFloat(row.p50_seconds) : null,
@@ -1027,9 +955,70 @@ export class Database {
       sample_count: row.sample_count ? parseInt(row.sample_count) : 0,
     });
 
+    const statsSQL = (col: string) => `
+      ROUND(AVG(${col})::numeric, 2) as avg_seconds,
+      ROUND(PERCENTILE_CONT(0.5) WITHIN GROUP (ORDER BY ${col})::numeric, 2) as p50_seconds,
+      ROUND(PERCENTILE_CONT(0.95) WITHIN GROUP (ORDER BY ${col})::numeric, 2) as p95_seconds,
+      ROUND(MIN(${col})::numeric, 2) as min_seconds,
+      ROUND(MAX(${col})::numeric, 2) as max_seconds,
+      COUNT(*) as sample_count
+    `;
+
+    // 1. Consensus round: Created → Accepted
+    //    How fast the validator group reaches agreement via Optimistic Democracy
+    const consensusRoundResult = await this.pool.query(`
+      WITH recent AS (
+        SELECT EXTRACT(EPOCH FROM accepted_at_timestamp - created_at_timestamp) as secs
+        FROM consensus_transactions
+        WHERE accepted_at_timestamp IS NOT NULL AND created_at_timestamp IS NOT NULL
+        ORDER BY accepted_at_block DESC LIMIT 200
+      )
+      SELECT ${statsSQL('secs')} FROM recent WHERE secs > 0
+    `);
+
+    // 2. Finalization: Accepted → Finalized (finality window duration)
+    const finalizationResult = await this.pool.query(`
+      WITH recent AS (
+        SELECT EXTRACT(EPOCH FROM finalized_at_timestamp - accepted_at_timestamp) as secs
+        FROM consensus_transactions
+        WHERE finalized_at_timestamp IS NOT NULL AND accepted_at_timestamp IS NOT NULL
+        ORDER BY finalized_at_block DESC LIMIT 200
+      )
+      SELECT ${statsSQL('secs')} FROM recent WHERE secs > 0
+    `);
+
+    // 3. End-to-end: Created → Finalized (total user-facing latency)
+    const endToEndResult = await this.pool.query(`
+      WITH recent AS (
+        SELECT EXTRACT(EPOCH FROM finalized_at_timestamp - created_at_timestamp) as secs
+        FROM consensus_transactions
+        WHERE finalized_at_timestamp IS NOT NULL AND created_at_timestamp IS NOT NULL
+        ORDER BY finalized_at_block DESC LIMIT 200
+      )
+      SELECT ${statsSQL('secs')} FROM recent WHERE secs > 0
+    `);
+
+    // 4. Epoch duration (target ~86400s = 1 day)
+    //    Use LAG to get previous epoch's timestamp (handles gaps like epoch 0→2 genesis skip)
+    const epochDurationResult = await this.pool.query(`
+      WITH ordered AS (
+        SELECT epoch, advanced_at_timestamp,
+          LAG(advanced_at_timestamp) OVER (ORDER BY epoch) as prev_ts
+        FROM epochs
+        WHERE advanced_at_timestamp IS NOT NULL
+        ORDER BY epoch DESC LIMIT 31
+      ),
+      epoch_diffs AS (
+        SELECT EXTRACT(EPOCH FROM advanced_at_timestamp - prev_ts) as secs
+        FROM ordered WHERE prev_ts IS NOT NULL
+      )
+      SELECT ${statsSQL('secs')} FROM epoch_diffs WHERE secs > 0
+    `);
+
     return {
-      block_time: parse(blockTimeResult.rows[0] || {}),
-      tx_finality: parse(txFinalityResult.rows[0] || {}),
+      consensus_round: parse(consensusRoundResult.rows[0] || {}),
+      finalization: parse(finalizationResult.rows[0] || {}),
+      end_to_end: parse(endToEndResult.rows[0] || {}),
       epoch_duration: parse(epochDurationResult.rows[0] || {}),
     };
   }
@@ -1105,8 +1094,9 @@ export class Database {
       total_staked: row.total_staked,
       network_uptime: parseFloat(parseFloat(uptimeResult.rows[0].network_uptime).toFixed(2)),
       event_throughput_24h: parseInt(row.event_throughput_24h),
-      block_time_avg_seconds: latency.block_time.avg_seconds,
-      tx_finality_avg_seconds: latency.tx_finality.avg_seconds,
+      consensus_round_avg_seconds: latency.consensus_round.avg_seconds,
+      finalization_avg_seconds: latency.finalization.avg_seconds,
+      end_to_end_avg_seconds: latency.end_to_end.avg_seconds,
       epoch_duration_avg_seconds: latency.epoch_duration.avg_seconds,
     };
   }

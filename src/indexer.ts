@@ -884,6 +884,7 @@ export class Indexer {
         await this.db.upsertConsensusTx(txId, {
           status: "accepted",
           acceptedAtBlock: blockNumber,
+          acceptedAtTimestamp: event.blockTimestamp,
         });
         break;
       }
