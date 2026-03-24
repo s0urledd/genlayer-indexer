@@ -1055,7 +1055,7 @@ export class Database {
   // Dashboard Summary (single-call aggregate for top bar)
   // ============================================================
 
-  async getDashboardSummary(rpcLatency?: { avgMs: number; p95Ms: number }) {
+  async getDashboardSummary() {
     const result = await this.pool.query(`
       SELECT
         (SELECT COUNT(*) FROM validators WHERE address != '${ZERO_ADDRESS}') as total_validators,
@@ -1064,12 +1064,11 @@ export class Database {
         (SELECT COUNT(*) FROM validators WHERE status = 'quarantined' AND address != '${ZERO_ADDRESS}') as quarantined_validators,
         (SELECT MAX(epoch) FROM epochs WHERE advanced_at_block IS NOT NULL) as latest_epoch,
         (SELECT COALESCE(SUM(total_stake), 0) FROM validators WHERE address != '${ZERO_ADDRESS}') as total_staked,
-        -- avg_uptime removed; network_uptime (computed below) is the primary metric
         (SELECT COUNT(*) FROM events WHERE block_timestamp > NOW() - INTERVAL '24 hours') as event_throughput_24h
     `);
     const row = result.rows[0];
 
-    // Network uptime = avg of last 30 actual epochs (skip gaps, exclude incomplete epochs)
+    // Network uptime = avg of last 30 finalized epochs
     const uptimeResult = await this.pool.query(`
       SELECT COALESCE(AVG(
         CASE WHEN COALESCE(e.validator_count,
@@ -1094,6 +1093,9 @@ export class Database {
       ) p ON p.epoch = e.epoch
     `);
 
+    // Real network latency from on-chain data
+    const latency = await this.getNetworkLatency();
+
     return {
       active_validators: parseInt(row.active_validators),
       banned_validators: parseInt(row.banned_validators),
@@ -1103,8 +1105,9 @@ export class Database {
       total_staked: row.total_staked,
       network_uptime: parseFloat(parseFloat(uptimeResult.rows[0].network_uptime).toFixed(2)),
       event_throughput_24h: parseInt(row.event_throughput_24h),
-      rpc_latency_avg_ms: rpcLatency?.avgMs ?? null,
-      rpc_latency_p95_ms: rpcLatency?.p95Ms ?? null,
+      block_time_avg_seconds: latency.block_time.avg_seconds,
+      tx_finality_avg_seconds: latency.tx_finality.avg_seconds,
+      epoch_duration_avg_seconds: latency.epoch_duration.avg_seconds,
     };
   }
 

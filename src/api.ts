@@ -1,7 +1,6 @@
 import http from "node:http";
 import { URL } from "node:url";
 import { Database } from "./db/queries.js";
-import type { Indexer } from "./indexer.js";
 
 class ValidationError extends Error {
   constructor(message: string) {
@@ -36,12 +35,10 @@ type RouteHandler = (
 export class Api {
   private server: http.Server;
   private db: Database;
-  private indexer?: Indexer;
   private routes: Map<string, RouteHandler> = new Map();
 
-  constructor(db: Database, port: number, indexer?: Indexer) {
+  constructor(db: Database, port: number) {
     this.db = db;
-    this.indexer = indexer;
     this.registerRoutes();
     this.server = http.createServer((req, res) => this.handleRequest(req, res));
     this.server.listen(port, "0.0.0.0", () => {
@@ -83,10 +80,7 @@ export class Api {
     // Dashboard top bar — single request for all key metrics
     // ──────────────────────────────────────────────────────────
     this.routes.set("GET /stats/summary", async () => {
-      const rpcLatency = this.indexer
-        ? this.indexer.getLatencyStats().rpcPing
-        : undefined;
-      return this.db.getDashboardSummary(rpcLatency);
+      return this.db.getDashboardSummary();
     });
 
     // ──────────────────────────────────────────────────────────
@@ -119,21 +113,10 @@ export class Api {
 
 
     // ──────────────────────────────────────────────────────────
-    // GET /stats/rpc-latency  (renamed from latency)
-    // Live RPC ping + log fetch duration from the indexer
-    // ──────────────────────────────────────────────────────────
-    this.routes.set("GET /stats/rpc-latency", async () => {
-      if (!this.indexer) {
-        return { error: "Indexer not connected" };
-      }
-      return this.indexer.getLatencyStats();
-    });
-
-    // ──────────────────────────────────────────────────────────
-    // GET /stats/network-latency
+    // GET /stats/latency
     // Real on-chain latency: block time, tx finality, epoch duration
     // ──────────────────────────────────────────────────────────
-    this.routes.set("GET /stats/network-latency", async () => {
+    this.routes.set("GET /stats/latency", async () => {
       return this.db.getNetworkLatency();
     });
 
@@ -400,7 +383,7 @@ export class Api {
             "GET /stats/network-uptime",
             "GET /stats/timeline",
             "GET /stats/event-activity",
-            "GET /stats/rpc-latency",
+            "GET /stats/latency",
             "GET /validators",
             "GET /validators/top",
             "GET /validators/:address",
