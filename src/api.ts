@@ -117,11 +117,6 @@ export class Api {
       return this.db.getThroughputStats(hours);
     });
 
-    // Keep old name as alias
-    this.routes.set("GET /stats/throughput", async (params) => {
-      const hours = parseIntParam(params, "hours", 24);
-      return this.db.getThroughputStats(hours);
-    });
 
     // ──────────────────────────────────────────────────────────
     // GET /stats/rpc-latency  (renamed from latency)
@@ -142,13 +137,6 @@ export class Api {
       return this.db.getNetworkLatency();
     });
 
-    // Keep old name as alias
-    this.routes.set("GET /stats/latency", async () => {
-      if (!this.indexer) {
-        return { error: "Indexer not connected" };
-      }
-      return this.indexer.getLatencyStats();
-    });
 
     // ──────────────────────────────────────────────────────────
     // GET /validators
